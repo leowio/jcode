@@ -1282,6 +1282,133 @@ fn test_autocomplete_adds_space_for_nested_argument_commands() {
 }
 
 #[test]
+fn test_fast_ultrafast_suggestions_include_both_aliases() {
+    let app = create_test_app();
+    for prefix in ["/fast ", "/fast u"] {
+        let suggestions = app.get_suggestions_for(prefix);
+        for command in ["/fast ultra", "/fast ultrafast"] {
+            assert!(
+                suggestions.iter().any(|(candidate, _)| candidate == command),
+                "{command} must be discoverable for {prefix:?}: {suggestions:?}"
+            );
+        }
+    }
+    for command in ["/fast ultra", "/fast ultrafast"] {
+        let suggestions = app.get_suggestions_for(command);
+        assert_eq!(
+            suggestions.first().map(|(candidate, _)| candidate.as_str()),
+            Some(command)
+        );
+    }
+}
+
+#[test]
+fn test_fast_ultrafast_enter_completes_then_submits_without_rewriting() {
+    ensure_test_jcode_home_if_unset();
+    let mut app = create_fast_test_app();
+    app.set_input_for_test("/fast u");
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+    assert_eq!(app.input(), "/fast ultra");
+    assert!(
+        app.provider.service_tier().is_none(),
+        "completion must not change tiers"
+    );
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+    assert!(app.input().is_empty());
+    assert_eq!(app.provider.service_tier().as_deref(), Some("ultrafast"));
+    assert!(!app.is_processing, "a tier command must not start inference");
+}
+
+#[test]
+fn test_fast_ultrafast_typed_aliases_submit_on_first_enter() {
+    ensure_test_jcode_home_if_unset();
+    for command in ["/fast ultra", "/fast ultrafast"] {
+        let mut app = create_fast_test_app();
+        app.set_input_for_test(command);
+
+        app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+            .unwrap();
+
+        assert!(
+            app.input().is_empty(),
+            "{command} must submit, not accept a fuzzy suggestion"
+        );
+        assert_eq!(app.provider.service_tier().as_deref(), Some("ultrafast"));
+        assert!(
+            app.display_messages()
+                .last()
+                .unwrap()
+                .content
+                .contains("configured on (Ultrafast)")
+        );
+        assert!(!app.is_processing);
+    }
+}
+
+#[test]
+fn test_fast_ultrafast_unsupported_provider_error_reaches_the_user() {
+    let mut app = create_test_app();
+    app.set_input_for_test("/fast ultra");
+
+    app.handle_key(KeyCode::Enter, KeyModifiers::empty())
+        .unwrap();
+
+    assert!(app.input().is_empty());
+    assert!(
+        app.display_messages()
+            .last()
+            .unwrap()
+            .content
+            .contains("Failed to set fast mode:")
+    );
+    assert!(app.provider.service_tier().is_none());
+    assert!(!app.is_processing);
+}
+
+#[test]
+fn test_fast_ultrafast_remote_enter_sends_the_requested_tier() {
+    use tokio::io::AsyncBufReadExt;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    for command in ["/fast ultra", "/fast ultrafast"] {
+        for processing in [false, true] {
+            let mut app = create_test_app();
+            app.is_remote = true;
+            app.remote_provider_name = Some("openai".to_string());
+            app.remote_provider_model = Some("gpt-6.1-sol".to_string());
+            app.remote_service_tier = Some("priority".to_string());
+            app.is_processing = processing;
+            app.set_input_for_test(command);
+
+            rt.block_on(async {
+                let mut remote = crate::tui::backend::RemoteConnection::dummy();
+                let mut reader = tokio::io::BufReader::new(remote.take_dummy_peer().unwrap());
+
+                app.handle_remote_key(KeyCode::Enter, KeyModifiers::empty(), &mut remote)
+                    .await
+                    .unwrap();
+
+                assert!(app.input().is_empty(), "{command} must reach remote dispatch");
+                assert_eq!(app.remote_service_tier.as_deref(), Some("priority"));
+                assert_eq!(app.is_processing, processing);
+                let mut line = String::new();
+                tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                    .await
+                    .expect("Enter must send a service-tier request")
+                    .unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(request["type"], "set_service_tier", "{line}");
+                assert_eq!(request["service_tier"], "ultrafast", "{line}");
+            });
+        }
+    }
+}
+
+#[test]
 fn test_goals_show_suggestions_include_goal_ids() {
     let _guard = crate::storage::lock_test_env();
     let temp = tempfile::tempdir().expect("tempdir");

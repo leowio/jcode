@@ -848,6 +848,8 @@ impl App {
         if prefix.starts_with("/fast ") {
             let modes = [
                 "on",
+                "ultra",
+                "ultrafast",
                 "off",
                 "status",
                 "default on",
