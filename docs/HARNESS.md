@@ -216,6 +216,15 @@ The TUI shows the waiting reason on the todo row, marks a required login with **
 
 The former `external_blocker` and `completely_blocked` item fields were removed. Saved todos that still carry them load as ordinary actionable todos, and a tool call that sends them is rejected with a pointer to the fields above.
 
+## Pinned intent and todos
+
+Use `/todos pin` to toggle the pinned plan above the conversation. Intent and
+todos share a lighter, full-width background with horizontal and vertical
+padding. Click the **Todos** header to fold or expand the task list, including
+short plans. Folding keeps intent and the completion count visible. Expanded
+plans scroll with the mouse wheel when they exceed the panel's height budget.
+Padding shrinks in short terminals to leave room for the conversation.
+
 ## Live worker status in todo lanes
 
 An assigned worker's todo lane shares the opened session's live status renderer: activity spinner, observed input/output tokens, streaming throughput, connection, elapsed time, and current tool intent. Missing telemetry is not guessed from context size or lifetime totals. Waiting and stopped workers show their available reason instead of a live spinner. A todo that needs the user to log in pauses only itself, without hiding independent work in the same lane.

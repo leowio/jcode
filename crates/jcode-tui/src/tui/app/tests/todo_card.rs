@@ -992,7 +992,7 @@ fn completed_background_tasks_clear_after_they_stop_being_relevant() {
 }
 
 #[test]
-fn clicking_pinned_todo_more_row_expands_the_band() {
+fn clicking_pinned_todo_header_expands_and_folds_the_band() {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     let _env_lock = crate::storage::lock_test_env();
@@ -1023,7 +1023,7 @@ fn clicking_pinned_todo_more_row_expands_the_band() {
     );
     let (lines, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
     let control = control.expect("expanded band needs a collapse control");
-    assert!(lines[control].to_string().contains("Collapse todos"));
+    assert!(lines[control].to_string().contains("click to fold"));
     app.handle_mouse_event(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: 8,
@@ -1032,11 +1032,12 @@ fn clicking_pinned_todo_more_row_expands_the_band() {
     });
     assert!(!app.pinned_todos_expanded);
     let (lines, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
-    assert!(control.is_none());
+    let control = control.expect("even short plans need an expand control");
+    assert!(lines[control].to_string().contains("click to expand"));
     assert!(
         !lines
             .iter()
-            .any(|line| line.to_string().contains("Collapse todos"))
+            .any(|line| line.to_string().contains("Current task"))
     );
     crate::tui::ui::viewport::set_pinned_todo_more_area_for_test(None);
 }
@@ -1064,9 +1065,9 @@ fn pinned_todo_card_shows_tasks_without_expanding() {
         }
         assert!(!rendered.contains("▸ todo"), "{rendered}");
         assert!(!rendered.contains("▾ todo"), "{rendered}");
-        assert!(crate::tui::ui::viewport::pinned_todo_more_area().is_none());
+        assert!(crate::tui::ui::viewport::pinned_todo_more_area().is_some());
         println!(
-            "{width}x40: all 3 todo states visible on first render, no expansion required or summary toggle"
+            "{width}x40: all 3 todo states visible on first render, header can fold them"
         );
     }
 }
@@ -1252,12 +1253,153 @@ fn expanded_pinned_todo_band_scrolls_when_taller_than_budget() {
     app.pinned_todos_payload = Some(serde_json::json!({ "todos": todos }).to_string());
     crate::tui::ui::viewport::reset_pinned_todo_scroll();
 
-    let (lines, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
+    let (lines, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
     assert!(lines.len() <= 21, "expanded band is bounded: {}", lines.len());
-    assert!(lines[0].to_string().contains("scroll"));
+    let control = control.unwrap();
+    assert!(lines[control].to_string().contains("scroll"));
     crate::tui::ui::viewport::publish_pinned_todo_scroll_for_test();
     assert!(crate::tui::ui::viewport::scroll_pinned_todos(3));
     let (scrolled, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
-    assert_ne!(lines[1].to_string(), scrolled[1].to_string());
+    assert_ne!(lines[control + 1].to_string(), scrolled[control + 1].to_string());
+    crate::tui::ui::viewport::reset_pinned_todo_scroll();
+}
+
+#[test]
+fn pinned_todo_panel_has_padding_and_clickable_fold_at_rendered_coordinates() {
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
+    let _pin = PinTodosEnvGuard::enable();
+    let mut app = create_test_app();
+    app.session.short_name = Some("test".into());
+    app.pinned_todos_payload = Some(serde_json::json!({
+        "todos": [
+            pinned_band_todo("done", "Finished task", "completed"),
+            pinned_band_todo("active", "Current task", "in_progress"),
+            pinned_band_todo("next", "Queued task", "pending"),
+        ],
+        "plan": {"user_intention": "Keep the plan distinct", "understands_user_intent": "clear"}
+    }).to_string());
+    app.push_display_message(DisplayMessage::assistant("ordinary transcript content"));
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+    let rendered = render_and_snap(&app, &mut terminal);
+    let control = crate::tui::ui::viewport::pinned_todo_more_area().unwrap();
+    let rows: Vec<_> = rendered.lines().collect();
+    let intent_row = rows.iter().position(|row| row.contains("Keep the plan distinct")).unwrap();
+    assert_eq!(control.y as usize, intent_row + 2, "intent and todos have a blank row between them");
+    assert!(rows[intent_row - 1].trim().is_empty(), "top padding");
+    assert!(rows[control.y as usize].contains("click to fold"));
+    let last_task = rows.iter().position(|row| row.contains("Queued task")).unwrap();
+    assert!(rows[last_task + 1].trim().is_empty(), "bottom padding");
+    let background = terminal.backend().buffer()[(control.x, control.y)].bg;
+    assert_ne!(background, ratatui::style::Color::Reset);
+    for y in intent_row as u16 - 1..=last_task as u16 + 1 {
+        for x in control.x..control.right() {
+            assert_eq!(terminal.backend().buffer()[(x, y)].bg, background, "full-width tint at ({x},{y})");
+        }
+    }
+    let prose_row = rows.iter().position(|row| row.contains("ordinary transcript content")).unwrap();
+    assert_ne!(terminal.backend().buffer()[(control.x, prose_row as u16)].bg, background);
+
+    for (kind, column, row) in [
+        (MouseEventKind::Down(MouseButton::Right), control.x, control.y),
+        (MouseEventKind::Down(MouseButton::Left), control.right(), control.y),
+        (MouseEventKind::Down(MouseButton::Left), control.x, control.y - 1),
+    ] {
+        app.handle_mouse_event(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
+        assert!(app.pinned_todos_expanded, "only a left click on the header folds tasks");
+    }
+    let click = |area: ratatui::layout::Rect| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.right() - 1,
+        row: area.y,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse_event(click(control));
+    assert!(!app.pinned_todos_expanded);
+    let folded = render_and_snap(&app, &mut terminal);
+    assert!(folded.contains("Keep the plan distinct"), "intent remains visible");
+    assert!(folded.contains("1/3 done"));
+    assert!(folded.contains("click to expand"));
+    assert!(!folded.contains("Current task"));
+    let control = crate::tui::ui::viewport::pinned_todo_more_area().unwrap();
+    app.handle_mouse_event(click(control));
+    assert!(app.pinned_todos_expanded);
+    assert!(render_and_snap(&app, &mut terminal).contains("Current task"));
+
+    app.pinned_todos_payload = None;
+    render_and_snap(&app, &mut terminal);
+    assert!(crate::tui::ui::viewport::pinned_todo_more_area().is_none(), "no stale click target after clearing todos");
+}
+
+#[test]
+fn pinned_todo_panel_fits_small_terminals_and_keeps_intent_when_scrolling() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _render_lock = crate::tui::ui::render_state_test_lock();
+    let _pin = PinTodosEnvGuard::enable();
+    let mut app = create_test_app();
+    let todos: Vec<_> = (0..40)
+        .map(|i| pinned_band_todo(&format!("t{i}"), &format!("界面 task {i}"), "pending"))
+        .collect();
+    app.pinned_todos_payload = Some(serde_json::json!({
+        "todos": todos,
+        "plan": {"user_intention": "Keep intent visible", "understands_user_intent": "clear"}
+    }).to_string());
+    for expanded in [false, true] {
+        app.pinned_todos_expanded = expanded;
+        for width in [0, 15, 16, 24, 40, 80, 200] {
+            for height in 0..45 {
+                let (lines, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, width, height);
+                assert!(lines.iter().all(|line| line.width() <= width as usize), "width {width}, height {height}");
+                if width >= 16 && height >= 3 {
+                    assert!(lines.len() < height as usize, "panel leaves transcript space at {width}x{height}");
+                    assert!(control.is_some_and(|row| row < lines.len()));
+                } else {
+                    assert!(lines.is_empty());
+                    assert!(control.is_none());
+                }
+            }
+        }
+    }
+    crate::tui::ui::viewport::reset_pinned_todo_scroll();
+    let (before, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
+    crate::tui::ui::viewport::publish_pinned_todo_scroll_for_test();
+    assert!(crate::tui::ui::viewport::scroll_pinned_todos(3));
+    let (after, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
+    let control = control.unwrap();
+    assert_eq!(before[..control], after[..control], "intent and padding stay fixed");
+    assert_ne!(before[control + 1], after[control + 1], "task window scrolls");
+    // Use explicit theme modes without changing process-global theme settings.
+    // Padding and trailing spaces must remain a panel on both dark and light terminals.
+    for mode in [jcode_tui_style::ThemeMode::Dark, jcode_tui_style::ThemeMode::Light] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 32)).unwrap();
+        let mut painted = None;
+        terminal.draw(|frame| {
+            let area = ratatui::layout::Rect::new(0, 0, 80, before.len() as u16);
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(before.clone()).style(
+                    ratatui::style::Style::default().bg(jcode_tui_style::theme::user_bg()),
+                ),
+                area,
+            );
+            jcode_tui_style::theme_mode::adapt_buffer(frame.buffer_mut(), mode);
+            painted = Some(frame.buffer_mut().clone());
+        }).unwrap();
+        // TestBackend omits continuation cells after wide CJK glyphs when it
+        // applies the terminal diff. Inspect the fully painted frame instead.
+        let buffer = painted.unwrap();
+        let background = buffer[(0, 0)].bg;
+        assert_ne!(background, ratatui::style::Color::Reset);
+        for y in 0..before.len() as u16 {
+            for x in 0..80 {
+                assert_eq!(buffer[(x, y)].bg, background, "{mode:?} surface at ({x},{y})");
+            }
+        }
+        assert_eq!(buffer[(0, before.len() as u16)].bg, ratatui::style::Color::Reset);
+    }
+    println!("expanded panel:\n{}", before.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
     crate::tui::ui::viewport::reset_pinned_todo_scroll();
 }

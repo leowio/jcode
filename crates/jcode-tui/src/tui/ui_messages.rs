@@ -1118,6 +1118,32 @@ pub(crate) fn render_pinned_todos_message(
         .collect()
 }
 
+/// Intent stays visible when the task list is folded. Share the same payload
+/// cache and gutter as the detailed card so live updates cannot drift apart.
+pub(super) fn pinned_todo_summary(payload: &str, width: u16) -> (Vec<Line<'static>>, String) {
+    let Some(payload) = cached_todo_payload(payload) else {
+        return (Vec::new(), "Todos".to_string());
+    };
+    let mut intent = Vec::new();
+    if let TodoCardPayload::Current { plan, .. } = payload.as_ref() {
+        push_todo_plan_details(
+            &mut intent,
+            plan,
+            "  ",
+            usize::from(width.saturating_sub(4)).max(1),
+            true,
+        );
+    }
+    let todos = payload.todos();
+    let completed = todos.iter().filter(|todo| todo.status == "completed").count();
+    let cancelled = todos.iter().filter(|todo| todo.status == "cancelled").count();
+    let mut label = format!("Todos · {completed}/{} done", todos.len());
+    if cancelled > 0 {
+        label.push_str(&format!(" · {cancelled} cancelled"));
+    }
+    (intent, label)
+}
+
 fn render_todos_message_with_cap(
     msg: &DisplayMessage,
     width: u16,
@@ -1146,7 +1172,7 @@ fn render_todos_message_with_cap(
     // Long assessment prose is useful in a wide transcript, but wrapping it
     // with a hanging label quickly overwhelms the actual task list in a narrow
     // terminal. Keep those details to one ellipsized line at small widths.
-    let compact_details = inner_width < 72;
+    let compact_details = !cap_width || inner_width < 72;
 
     let mut lines = Vec::new();
     // Finished transcript cards are a compact historical marker. Keep the

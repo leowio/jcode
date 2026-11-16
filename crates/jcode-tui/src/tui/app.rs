@@ -1552,7 +1552,7 @@ pub struct App {
     /// Last time the pinned todo band re-read todos from disk (1s throttle).
     #[allow(dead_code)]
     pinned_todos_checked_at: Option<Instant>,
-    /// User-expanded state for the pinned todo band's `+N more` row.
+    /// Whether the pinned task list is open. Intent remains visible when folded.
     pinned_todos_expanded: bool,
     /// Running and terminal background tasks shown beneath the pinned todo band.
     background_task_rows: Vec<crate::tui::BackgroundTaskRow>,

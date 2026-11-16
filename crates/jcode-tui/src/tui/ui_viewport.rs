@@ -1245,7 +1245,10 @@ pub(super) fn draw_messages(
             height: pinned_todo_lines.min(render_area.height),
         };
         clear_area(frame, band_area);
-        frame.render_widget(Paragraph::new(pinned_todo_band), band_area);
+        frame.render_widget(
+            Paragraph::new(pinned_todo_band).style(Style::default().bg(user_bg())),
+            band_area,
+        );
     }
 
     if crate::config::config().display.prompt_preview && scroll > 0 && prompt_history_expanded() {
@@ -1437,6 +1440,7 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
         return (Vec::new(), None);
     }
 
+    let content_width = width.saturating_sub(3);
     let card_lines = if crate::config::config().display.pin_todos {
         payload.map_or_else(Vec::new, |payload| {
             // Distinct title keeps the line cache from sharing entries with
@@ -1445,7 +1449,7 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
             msg.title = Some("Pinned todos".to_string());
             super::messages::get_cached_message_lines(
                 &msg,
-                width,
+                content_width,
                 diff_mode,
                 super::messages::render_pinned_todos_message,
             )
@@ -1460,52 +1464,70 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
     let mut card_lines = card_lines;
     super::messages::animate_lane_spinners(&mut card_lines);
 
-    // Band budget: about a third of the viewport.
-    let budget = ((viewport_height as usize) / 3).clamp(2, 12);
-    let content_budget = budget.max(2);
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    let has_more = card_lines.len() > content_budget && !expanded;
-    let mut more_line = None;
-    if has_more {
-        let shown = content_budget.saturating_sub(1);
-        let hidden = card_lines.len() - shown;
-        lines.extend(card_lines.into_iter().take(shown));
-        more_line = Some(lines.len());
-        lines.push(Line::from(Span::styled(
-            format!("  … +{} more (todo)", hidden),
-            Style::default().fg(dim_color()),
-        )));
+    let (intent, summary) =
+        super::messages::pinned_todo_summary(payload.unwrap_or_default(), content_width);
+    // Intent is fixed chrome, not part of the task list's scrolling window.
+    let task_lines = &card_lines[intent.len().min(card_lines.len())..];
+    let padding = usize::from(viewport_height >= 9);
+    let intent_gap = usize::from(!intent.is_empty() && viewport_height >= 12);
+    let chrome_rows = padding * 2 + intent.len() + intent_gap + 1;
+    // Leave transcript space even in short terminals. Extra padding yields to
+    // content at small heights, and long plans scroll inside their own panel.
+    let budget = (usize::from(viewport_height) * 2 / 3)
+        .max(chrome_rows + 1)
+        .min(usize::from(viewport_height).saturating_sub(1));
+    let window = budget.saturating_sub(chrome_rows);
+    let max_offset = if expanded && window > 0 {
+        task_lines.len().saturating_sub(window)
     } else {
-        if expanded {
-            // Expanded bands get a larger budget but stay bounded so a long plan
-            // cannot swallow the transcript. Overflow scrolls with the wheel.
-            let expanded_budget = ((viewport_height as usize) * 2 / 3).max(content_budget);
-            let window = expanded_budget.saturating_sub(1).max(1);
-            let total = card_lines.len();
-            let max_offset = total.saturating_sub(window);
-            let offset = pinned_todo_scroll().min(max_offset);
-            PINNED_TODO_LAST_MAX.store(max_offset, std::sync::atomic::Ordering::Relaxed);
-            more_line = Some(lines.len());
-            let label = if max_offset > 0 {
-                format!(
-                    "  ▴ Collapse todos ({}-{} of {}, scroll)",
-                    offset + 1,
-                    (offset + window).min(total),
-                    total
-                )
-            } else {
-                "  ▴ Collapse todos".to_string()
-            };
-            lines.push(Line::from(Span::styled(
-                label,
-                Style::default().fg(dim_color()),
-            )));
-            lines.extend(card_lines.into_iter().skip(offset).take(window));
-            return (lines, more_line);
-        }
-        lines.extend(card_lines);
+        0
+    };
+    let offset = pinned_todo_scroll().min(max_offset);
+    PINNED_TODO_LAST_MAX.store(max_offset, std::sync::atomic::Ordering::Relaxed);
+
+    let mut lines = vec![Line::raw(""); padding];
+    lines.extend(intent);
+    lines.extend(std::iter::repeat_n(Line::raw(""), intent_gap));
+    let toggle_line = lines.len();
+    let mut label = format!(
+        "  {} {summary} · click to {}",
+        if expanded { "▾" } else { "▸" },
+        if expanded { "fold" } else { "expand" },
+    );
+    if expanded && max_offset > 0 {
+        label.push_str(&format!(
+            " · {}-{} of {} · scroll",
+            offset + 1,
+            (offset + window).min(task_lines.len()),
+            task_lines.len(),
+        ));
     }
-    (lines, more_line)
+    lines.push(Line::styled(label, Style::default().fg(tool_color()).bold()));
+    if expanded {
+        lines.extend(task_lines.iter().skip(offset).take(window).cloned());
+    }
+    lines.extend(std::iter::repeat_n(Line::raw(""), padding));
+    let lines = lines
+        .into_iter()
+        .map(|mut line| {
+            line.spans.insert(0, Span::raw(" "));
+            let mut line = super::truncate_line_with_ellipsis_to_width(
+                &line,
+                usize::from(width.saturating_sub(2)),
+            );
+            line.spans.push(Span::raw(" ".repeat(
+                usize::from(width).saturating_sub(line.width()),
+            )));
+            line.style = line.style.bg(user_bg());
+            // Task markers can carry Style::reset(), which otherwise punches
+            // terminal-default holes through the panel's inherited surface.
+            for span in &mut line.spans {
+                span.style = span.style.bg(user_bg());
+            }
+            line
+        })
+        .collect();
+    (lines, Some(toggle_line))
 }
 
 static PINNED_TODO_SCROLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
