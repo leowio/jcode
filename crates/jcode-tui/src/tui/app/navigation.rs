@@ -1541,10 +1541,6 @@ impl App {
             && let Some(action) = crate::tui::ui::viewport::pinned_todo_action_at(mouse.column, mouse.row)
         {
             match action {
-                crate::tui::ui::viewport::PinnedTodoAction::AllDetails => {
-                    self.pinned_todos_expanded = !self.pinned_todos_expanded;
-                    self.pinned_todo_expanded_lanes.clear();
-                }
                 crate::tui::ui::viewport::PinnedTodoAction::Lane(key) => {
                     let key = if self.pinned_todos_expanded { format!("!{key}") } else { key };
                     if let Some(index) = self.pinned_todo_expanded_lanes.iter().position(|item| item == &key) {
@@ -1559,16 +1555,6 @@ impl App {
             }
             crate::tui::ui::viewport::reset_pinned_todo_scroll();
             finish_mouse_event!(false, "pinned_todo_details");
-        }
-
-        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
-            && crate::tui::ui::viewport::pinned_todo_more_area().is_some_and(|area| {
-                super::super::layout_utils::point_in_rect(mouse.column, mouse.row, area)
-            })
-        {
-            self.pinned_todos_expanded = !self.pinned_todos_expanded;
-            crate::tui::ui::viewport::reset_pinned_todo_scroll();
-            finish_mouse_event!(false, "pinned_todos_toggle");
         }
 
         if matches!(

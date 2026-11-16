@@ -11,8 +11,6 @@ mod todo_stages;
 pub(crate) use todo_stages::TodoCardAgent;
 pub(crate) use todo_stages::animate_lane_spinners;
 use todo_stages::{agent_roster_spans, push_stage_pips, render_todo_item_line};
-#[cfg(test)]
-use todo_stages::push_stage_lines;
 
 use super::*;
 #[path = "ui_messages_cache.rs"]
@@ -1139,7 +1137,8 @@ pub(super) fn render_pinned_todos_with_details(
         return hit;
     }
     let mut targets = Vec::new();
-    let mut lines = render_todo_card_with_details(msg, width, diff_mode, false, expanded_lanes, &mut targets);
+    // Reserve two cells for the disclosure marker before wrapping task text.
+    let mut lines = render_todo_card_with_details(msg, width.saturating_sub(2), diff_mode, false, expanded_lanes, &mut targets);
     for (row, key) in &targets {
         let expanded = expanded_lanes.iter().any(|item| item == "*" || item == key)
             && !expanded_lanes.iter().any(|item| item == &format!("!{key}"));
@@ -1156,9 +1155,9 @@ pub(super) fn render_pinned_todos_with_details(
     (lines, targets)
 }
 
-pub(super) fn pinned_todo_intent(payload: &str, width: u16, expanded: bool) -> (Vec<Line<'static>>, String, bool) {
+pub(super) fn pinned_todo_intent(payload: &str, width: u16, expanded: bool) -> (Vec<Line<'static>>, bool) {
     let Some(payload) = cached_todo_payload(payload) else {
-        return (Vec::new(), "Todos".to_string(), false);
+        return (Vec::new(), false);
     };
     let mut intent = Vec::new();
     if let TodoCardPayload::Current { plan, .. } = payload.as_ref() {
@@ -1178,19 +1177,14 @@ pub(super) fn pinned_todo_intent(payload: &str, width: u16, expanded: bool) -> (
             None => String::new(),
         }
     } else { String::new() };
-    let can_unwrap = full_intent.width() > usize::from(width.saturating_sub(2));
+    let can_unwrap = full_intent.width() > usize::from(width.saturating_sub(4));
     if expanded && can_unwrap {
-        intent = wrap_todo_detail(full_intent.trim(), usize::from(width.saturating_sub(4)).max(1))
-            .into_iter().map(|chunk| Line::styled(format!("  {chunk}"), Style::default().fg(todo_meta_color()))).collect();
+        intent = wrap_todo_detail(full_intent.trim(), usize::from(width.saturating_sub(6)).max(1))
+            .into_iter().map(|chunk| Line::from(vec![
+                Span::raw("  "), Span::styled(chunk, Style::default().fg(todo_meta_color())),
+            ])).collect();
     }
-    let todos = payload.todos();
-    let completed = todos.iter().filter(|todo| todo.status == "completed").count();
-    let cancelled = todos.iter().filter(|todo| todo.status == "cancelled").count();
-    let mut label = format!("Todos · {completed}/{} done", todos.len());
-    if cancelled > 0 {
-        label.push_str(&format!(" · {cancelled} cancelled"));
-    }
-    (intent, label, can_unwrap)
+    (intent, can_unwrap)
 }
 
 fn render_todos_message_with_cap(
@@ -1350,8 +1344,21 @@ fn render_todo_card_with_details(
             if goal.is_some() {
                 push_todo_goal_details(&mut lines, goal, base_indent, inner_width, compact_details);
             }
-            if expanded_lanes.iter().any(|item| item == "*") {
-                push_expanded_todo_items(&mut lines, &all_refs, base_indent, inner_width);
+            if !cap_width {
+                for todo in &all_refs {
+                    let key = todo.id.clone();
+                    let expanded = expanded_lanes.iter().any(|item| item == "*" || item == &key)
+                        && !expanded_lanes.iter().any(|item| item == &format!("!{key}"));
+                    targets.push((lines.len(), key));
+                    if expanded {
+                        push_expanded_todo_items(&mut lines, &[*todo], base_indent, inner_width);
+                    } else {
+                        let line = render_todo_item_line_with_background(
+                            todo, &agents, &background_tasks, base_indent, inner_width,
+                        );
+                        lines.push(with_inline_todo_confidence(line, todo, base_indent.width() + inner_width));
+                    }
+                }
                 todo_stages::push_lane_status_lines_below_rows(&mut lines, &all_refs, &agents, base_indent, inner_width);
             } else {
                 push_todo_item_lines(
@@ -1715,36 +1722,62 @@ fn push_expanded_todo_items(
         let spans = todo_card_item_spans(todo, false);
         let glyph = spans[1].clone();
         let available = inner_width.saturating_sub(4).max(1);
-        for (index, chunk) in wrap_todo_detail(&todo.content, available).into_iter().enumerate() {
-            lines.push(todo_card_line(vec![
+        let badge = todo_inline_confidence(todo).filter(|badge| badge.width() + 8 <= available).map(|badge| {
+            super::truncate_line_with_ellipsis_to_width(
+                &Line::styled(badge, Style::default().fg(todo_confidence_color())),
+                available.saturating_sub(1),
+            )
+        });
+        let title_width = available.saturating_sub(badge.as_ref().map_or(0, Line::width)).max(1);
+        for (index, chunk) in wrap_todo_detail(&todo.content, title_width).into_iter().enumerate() {
+            let mut row = vec![
                 Span::raw("  "),
                 if index == 0 { glyph.clone() } else { Span::raw("  ") },
                 Span::styled(chunk, spans[2].style),
-            ], base_indent, inner_width));
+            ];
+            if index == 0 && let Some(badge) = &badge {
+                row.extend(badge.spans.clone());
+            }
+            lines.push(todo_card_line(row, base_indent, inner_width));
         }
         if let Some(description) = todo.details.as_deref().filter(|text| !text.trim().is_empty()) {
             for chunk in wrap_todo_detail(description, available) {
                 lines.push(todo_card_line(vec![Span::raw("    "), Span::styled(chunk, Style::default().fg(todo_meta_color()))], base_indent, inner_width));
             }
         }
-        if let Some(confidence) = if todo.status == "completed" {
-            todo.completion_confidence.or(todo.confidence)
-        } else {
-            todo.confidence
-        } {
-            let label = if todo.status == "completed" && todo.completion_confidence.is_some() {
-                "Completion confidence"
-            } else {
-                "Agent confidence"
-            };
-            for chunk in wrap_todo_detail(&format!("{label}: {}", confidence.as_str()), available) {
-                lines.push(todo_card_line(vec![
-                    Span::raw("    "),
-                    Span::styled(chunk, Style::default().fg(todo_confidence_color())),
-                ], base_indent, inner_width));
+        if crate::todo::todo_requires_user_auth(todo) {
+            for chunk in wrap_todo_detail(&todo_complete_blocker_detail(todo), available) {
+                lines.push(todo_card_line(vec![Span::raw("    "), Span::styled(chunk, Style::default().fg(todo_warning_color()))], base_indent, inner_width));
             }
         }
     }
+}
+
+fn todo_inline_confidence(todo: &crate::todo::TodoItem) -> Option<String> {
+    let confidence = if todo.status == "completed" {
+        todo.completion_confidence.or(todo.confidence)
+    } else {
+        todo.confidence
+    }?;
+    Some(format!(" [{}]", confidence.as_str()))
+}
+
+fn with_inline_todo_confidence(
+    line: Line<'static>,
+    todo: &crate::todo::TodoItem,
+    width: usize,
+) -> Line<'static> {
+    let Some(badge) = todo_inline_confidence(todo) else { return line; };
+    if width < badge.width() + 12 {
+        return line;
+    }
+    let badge = super::truncate_line_with_ellipsis_to_width(
+        &Line::styled(badge, Style::default().fg(todo_confidence_color())),
+        width.saturating_sub(6),
+    );
+    let mut line = super::truncate_line_with_ellipsis_to_width(&line, width.saturating_sub(badge.width()));
+    line.spans.extend(badge.spans);
+    line
 }
 
 fn wrap_todo_detail(value: &str, width: usize) -> Vec<String> {

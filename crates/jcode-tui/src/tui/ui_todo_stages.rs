@@ -971,13 +971,15 @@ pub(super) fn push_stage_lines_with_details(
                 || !todo_running_dependencies(todo, background_tasks).is_empty()
         }) {
             for todo in &items {
-                lines.push(render_todo_item_line_with_background(
-                    todo,
-                    agents,
-                    background_tasks,
-                    base_indent,
-                    inner_width,
-                ));
+                targets.push((lines.len(), key.clone()));
+                if expanded {
+                    push_expanded_todo_items(lines, &[*todo], base_indent, inner_width);
+                } else {
+                    let line = render_todo_item_line_with_background(
+                        todo, agents, background_tasks, base_indent, inner_width,
+                    );
+                    lines.push(with_inline_todo_confidence(line, todo, base_indent.width() + inner_width));
+                }
             }
             push_lane_status_lines_below_rows(lines, &items, agents, base_indent, inner_width);
             continue;

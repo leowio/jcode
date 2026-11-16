@@ -350,7 +350,7 @@ pub(super) fn draw_messages(
     let viewport_height = render_area.height as usize;
     // Pinned todo band (display.pin_todos): the full todo card rendered beneath
     // the sticky previous-prompt preview, including at the top of the transcript.
-    let (pinned_todo_band, pinned_todo_more_line) =
+    let (pinned_todo_band, _) =
         pinned_todo_band_lines(app, text_render_area.width, render_area.height);
     let pinned_todo_actions = PINNED_TODO_ROW_ACTIONS.with_borrow(Clone::clone);
     let pinned_todo_band_rows = pinned_todo_band.len() as u16;
@@ -435,17 +435,6 @@ pub(super) fn draw_messages(
         y: render_area.y.saturating_add(prompt_preview_lines),
         width: text_render_area.width,
         height: pinned_todo_band_rows,
-    }));
-    set_pinned_todo_more_area(pinned_todo_more_line.map(|line| {
-        Rect {
-            x: text_render_area.x,
-            y: render_area
-                .y
-                .saturating_add(prompt_preview_lines)
-                .saturating_add(line as u16),
-            width: text_render_area.width,
-            height: 1,
-        }
     }));
     if !super::secondary_render_active() {
         PINNED_TODO_CLICK_AREAS.with_borrow_mut(|areas| {
@@ -1454,7 +1443,6 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
 
 #[derive(Clone, Debug)]
 pub(crate) enum PinnedTodoAction {
-    AllDetails,
     Lane(String),
     Intent,
 }
@@ -1466,6 +1454,13 @@ thread_local! {
 
 pub(crate) fn pinned_todo_action_at(x: u16, y: u16) -> Option<PinnedTodoAction> {
     PINNED_TODO_CLICK_AREAS.with_borrow(|targets| targets.iter().find(|(area, _)| area.contains((x, y).into())).map(|(_, action)| action.clone()))
+}
+
+#[cfg(test)]
+pub(crate) fn pinned_todo_lane_area_for_test(key: &str) -> Option<Rect> {
+    PINNED_TODO_CLICK_AREAS.with_borrow(|targets| targets.iter().find_map(|(area, action)| {
+        matches!(action, PinnedTodoAction::Lane(id) if id == key).then_some(*area)
+    }))
 }
 
 fn pinned_todo_band_with_details(
@@ -1510,10 +1505,17 @@ fn pinned_todo_band_with_details(
     let mut card_lines = card_lines;
     super::messages::animate_lane_spinners(&mut card_lines);
 
-    let (mut intent, summary, intent_can_unwrap) =
+    let (mut intent, intent_can_unwrap) =
         super::messages::pinned_todo_intent(payload.unwrap_or_default(), content_width, intent_expanded);
     let source_intent_rows = usize::from(!intent.is_empty());
-    intent.truncate(usize::from(viewport_height.saturating_sub(5)).max(1));
+    let padding = usize::from(viewport_height >= 9);
+    let intent_gap = usize::from(!intent.is_empty() && viewport_height >= 12);
+    let budget = (usize::from(viewport_height) * 2 / 3)
+        .max(padding * 2 + intent_gap + source_intent_rows + 1)
+        .min(usize::from(viewport_height).saturating_sub(1));
+    // Long intent must not consume the task window or the conversation.
+    let max_intent_rows = budget.saturating_sub(padding * 2 + intent_gap + 2).max(1);
+    intent.truncate(max_intent_rows);
     if intent_can_unwrap && let Some(first) = intent.first_mut() {
         first.spans.insert(1.min(first.spans.len()), Span::styled(
             if intent_expanded { "▾ " } else { "▸ " }, Style::default().fg(tool_color()),
@@ -1521,14 +1523,9 @@ fn pinned_todo_band_with_details(
     }
     // Intent is fixed chrome, not part of the task list's scrolling window.
     let task_lines = &card_lines[source_intent_rows.min(card_lines.len())..];
-    let padding = usize::from(viewport_height >= 9);
-    let intent_gap = usize::from(!intent.is_empty() && viewport_height >= 12);
-    let chrome_rows = padding * 2 + intent.len() + intent_gap + 1;
+    let chrome_rows = padding * 2 + intent.len() + intent_gap;
     // Leave transcript space even in short terminals. Extra padding yields to
     // content at small heights, and long plans scroll inside their own panel.
-    let budget = (usize::from(viewport_height) * 2 / 3)
-        .max(chrome_rows + 1)
-        .min(usize::from(viewport_height).saturating_sub(1));
     let window = budget.saturating_sub(chrome_rows);
     let max_offset = if window > 0 {
         task_lines.len().saturating_sub(window)
@@ -1545,26 +1542,11 @@ fn pinned_todo_band_with_details(
     }
     lines.extend(intent);
     lines.extend(std::iter::repeat_n(Line::raw(""), intent_gap));
-    let toggle_line = lines.len();
-    let mut label = format!(
-        "  {} {summary} · click to {}",
-        if expanded { "▾" } else { "▸" },
-        if expanded { "compact details" } else { "expand details" },
-    );
-    if max_offset > 0 {
-        label.push_str(&format!(
-            " · {}-{} of {} · scroll",
-            offset + 1,
-            (offset + window).min(task_lines.len()),
-            task_lines.len(),
-        ));
-    }
-    lines.push(Line::styled(label, Style::default().fg(tool_color()).bold()));
-    actions.push((toggle_line, PinnedTodoAction::AllDetails));
+    let task_start = lines.len();
     for (source_row, key) in lane_targets {
         let source_row = source_row.saturating_sub(source_intent_rows);
         if source_row >= offset && source_row < offset + window {
-            actions.push((toggle_line + 1 + source_row - offset, PinnedTodoAction::Lane(key)));
+            actions.push((task_start + source_row - offset, PinnedTodoAction::Lane(key)));
         }
     }
     lines.extend(task_lines.iter().skip(offset).take(window).cloned());
@@ -1592,7 +1574,7 @@ fn pinned_todo_band_with_details(
             line
         })
         .collect();
-    (lines, Some(toggle_line))
+    (lines, Some(task_start))
 }
 
 static PINNED_TODO_SCROLL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1654,26 +1636,6 @@ pub(crate) fn pinned_todo_scroll_area() -> Option<Rect> {
         return None;
     }
     PINNED_TODO_BAND_AREA.lock().ok().and_then(|area| *area)
-}
-
-static PINNED_TODO_MORE_AREA: std::sync::Mutex<Option<Rect>> = std::sync::Mutex::new(None);
-
-fn set_pinned_todo_more_area(area: Option<Rect>) {
-    if super::secondary_render_active() {
-        return;
-    }
-    if let Ok(mut current) = PINNED_TODO_MORE_AREA.lock() {
-        *current = area;
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn set_pinned_todo_more_area_for_test(area: Option<Rect>) {
-    set_pinned_todo_more_area(area);
-}
-
-pub(crate) fn pinned_todo_more_area() -> Option<Rect> {
-    PINNED_TODO_MORE_AREA.lock().ok().and_then(|area| *area)
 }
 
 /// The same previous-prompt band for live sessions and resume previews. Work on
