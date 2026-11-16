@@ -40,6 +40,9 @@ fn transient_failures_are_retried() {
         "HTTP 503 Service Unavailable",
         "HTTP status 500: internal server error",
         "dns error: failed to lookup address information",
+        "OAuth token refresh failed: HTTP 503 Service Unavailable",
+        "OpenAI response did not complete within 600 seconds",
+        "stream disconnected before completion",
     ] {
         assert_eq!(
             classify_failure(message, None),
@@ -270,6 +273,50 @@ fn disabled_policy_never_schedules() {
             ..
         }
     ));
+}
+
+#[test]
+fn unlimited_policy_retries_past_old_limits_and_honors_server_waits() {
+    let now = Instant::now();
+    let mut retry = TurnRetry::new(RetryPolicy::unlimited());
+    for expected in 1..=20 {
+        let decision = retry.observe(&error("HTTP 503 Service Unavailable"), now);
+        let (attempt, delay) = scheduled(&decision).expect("unlimited retry scheduled");
+        assert_eq!(attempt, expected);
+        assert!(delay <= Duration::from_secs(30));
+        assert!(retry.take_due(now + delay));
+    }
+    let decision = retry.observe(&error("429 rate limit, retry after 2 hours"), now);
+    assert_eq!(scheduled(&decision), Some((21, Duration::from_secs(7200))));
+    assert_eq!(retry.user_cancelled(), RetryDecision::Cancelled);
+    assert!(matches!(
+        retry.observe(&error("HTTP 503"), now),
+        RetryDecision::GaveUp {
+            exhausted: false,
+            ..
+        }
+    ));
+    retry.send_failed(now);
+    assert!(
+        retry.pending().is_none(),
+        "late send failure must not resurrect cancellation"
+    );
+    retry.user_sent();
+    assert!(matches!(
+        retry.observe(&error("401 Unauthorized then connection reset"), now),
+        RetryDecision::GaveUp {
+            exhausted: false,
+            ..
+        }
+    ));
+    assert!(retry.pending().is_none());
+    assert_eq!(
+        classify_failure(
+            "unsafe_to_replay: connection reset after native tools",
+            None
+        ),
+        FailureKind::Permanent
+    );
 }
 
 #[test]

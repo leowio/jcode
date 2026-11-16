@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net",
 tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
 async-trait = "0.1"
+async-stream = "0.3"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "charset", "http2", "system-proxy", "rustls-tls", "rustls-tls-native-roots"] }
@@ -132,8 +133,6 @@ jcode-docs-data = { path = "../jcode-docs-data" }
 # Paused-time browser tests must compile when this package is tested alone,
 # without inheriting test-util from another workspace package's dev-dependencies.
 tokio = { version = "1", features = ["test-util"] }
-# Used by async streaming tests (ambient/runner_tests, server/client_actions_tests).
-async-stream = "0.3"
 # Enables jcode-base's test-support helpers (storage::lock_test_env,
 # auth::test_sandbox, bus::reset_models_updated_publish_state_for_tests) for
 # *this* crate's own test target. Feature unification applies this only to

@@ -740,7 +740,11 @@ impl std::fmt::Display for ConnectionPhase {
             ConnectionPhase::WaitingForResponse => write!(f, "waiting for response"),
             ConnectionPhase::Streaming => write!(f, "streaming"),
             ConnectionPhase::Retrying { attempt, max } => {
-                write!(f, "retrying ({}/{})", attempt, max)
+                if *max == u32::MAX {
+                    write!(f, "retrying ({attempt}/unlimited)")
+                } else {
+                    write!(f, "retrying ({}/{})", attempt, max)
+                }
             }
         }
     }
@@ -878,6 +882,22 @@ pub fn replace_text_suffix(text: &mut String, old_text: &str, new_text: &str) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_phase_formats_unlimited_retries_without_a_numeric_limit() {
+        assert_eq!(
+            ConnectionPhase::Retrying {
+                attempt: 9,
+                max: u32::MAX
+            }
+            .to_string(),
+            "retrying (9/unlimited)"
+        );
+        assert_eq!(
+            ConnectionPhase::Retrying { attempt: 2, max: 3 }.to_string(),
+            "retrying (2/3)"
+        );
+    }
 
     #[test]
     fn suffix_correction_preserves_unicode_prefix_and_rejects_stale_snapshots() {

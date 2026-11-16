@@ -46,6 +46,7 @@ pub struct GeminiProvider {
     model: Arc<RwLock<String>>,
     state: Arc<Mutex<Option<CachedGeminiState>>>,
     fetched_models: Arc<RwLock<Vec<String>>>,
+    consumer: Option<mpsc::Sender<Result<StreamEvent>>>,
 }
 
 /// How the Gemini provider authenticates to Google.
@@ -79,6 +80,7 @@ impl GeminiProvider {
             model: Arc::new(RwLock::new(model)),
             state: Arc::new(Mutex::new(None)),
             fetched_models: Arc::new(RwLock::new(Vec::new())),
+            consumer: None,
         };
         provider.seed_cached_catalog();
         provider
@@ -246,25 +248,60 @@ impl GeminiProvider {
         })
     }
 
-    /// Send a request with a single transient-error retry, transparently
-    /// rebuilding the HTTP client on the second attempt. The `make` closure
-    /// produces a fully-configured (auth + body) request builder for each try.
+    fn retry_policy(
+        &self,
+        max_attempts: Option<u32>,
+    ) -> jcode_provider_core::retry_policy::RetryPolicy {
+        let config = jcode_base::config::config();
+        jcode_provider_core::retry_policy::RetryPolicy::new(
+            max_attempts.unwrap_or(config.provider.max_retries),
+            Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1)),
+        )
+    }
+
+    /// Cancellation is observed only at transport boundaries. OAuth refreshes
+    /// finish their credential commit before reaching these waits.
+    async fn while_consumer_open<T>(
+        &self,
+        operation: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        match &self.consumer {
+            Some(tx) => tokio::select! {
+                biased;
+                _ = tx.closed() => anyhow::bail!("Stream receiver dropped"),
+                result = operation => Ok(result),
+            },
+            None => Ok(operation.await),
+        }
+    }
+
+    /// Rebuild the HTTP client after transient transport failures. Model turns
+    /// honor the configured retry policy; discovery/onboarding remain bounded.
     async fn send_with_retry<F>(&self, make: F, url: &str) -> Result<reqwest::Response>
     where
         F: Fn(reqwest::Client) -> reqwest::RequestBuilder,
     {
         let mut last_error: Option<anyhow::Error> = None;
-        for attempt in 0..2 {
+        let policy = self.retry_policy((!url.contains("generateContent")).then_some(2));
+        for attempt in policy.attempts() {
             let client = if attempt == 0 {
                 self.client.clone()
             } else {
                 gemini_http_client()
             };
-            match make(client).send().await {
+            match self.while_consumer_open(make(client).send()).await? {
                 Ok(response) => return Ok(response),
-                Err(err) if attempt == 0 && is_transient_gemini_transport_error(&err) => {
+                Err(err)
+                    if policy.allows_retry_after(attempt)
+                        && is_transient_gemini_transport_error(&err) =>
+                {
                     last_error = Some(err.into());
-                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    self.while_consumer_open(tokio::time::sleep(policy.delay(
+                        attempt.saturating_add(1),
+                        None,
+                        250,
+                    )))
+                    .await?;
                 }
                 Err(err) => {
                     return Err(err).with_context(|| format!("Gemini request to {} failed", url));
@@ -292,6 +329,8 @@ impl GeminiProvider {
         // unavailable", "No capacity available"), which otherwise kill a
         // long session mid-turn.
         let mut attempt: u32 = 0;
+        let policy =
+            self.retry_policy((method != "generateContent").then_some(MAX_HTTP_RETRIES + 1));
         loop {
             let resp = self
                 .send_with_retry(
@@ -309,24 +348,33 @@ impl GeminiProvider {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let retry_after = jcode_provider_core::retry_after::retry_after(resp.headers());
-                let body = jcode_base::util::http_error_body(resp, "HTTP error").await;
+                let body = self
+                    .while_consumer_open(jcode_base::util::http_error_body(resp, "HTTP error"))
+                    .await?;
                 if let Some(delay) = gemini_http_retry_delay(
+                    policy,
                     method,
                     status,
                     &body,
                     attempt,
-                    retry_after.map(|hint| hint.remaining()),
+                    retry_after.map(|hint| {
+                        if policy.is_unlimited() {
+                            hint.remaining_unbounded()
+                        } else {
+                            hint.remaining()
+                        }
+                    }),
                 ) {
                     jcode_base::logging::warn(&format!(
                         "Gemini {} hit transient HTTP {} (attempt {}/{}); retrying in {:?}",
                         method,
                         status.as_u16(),
-                        attempt + 1,
-                        MAX_HTTP_RETRIES,
+                        attempt.saturating_add(1),
+                        policy.max_attempts(),
                         delay
                     ));
-                    attempt += 1;
-                    tokio::time::sleep(delay).await;
+                    attempt = attempt.saturating_add(1);
+                    self.while_consumer_open(tokio::time::sleep(delay)).await?;
                     continue;
                 }
                 return Err(jcode_provider_core::retry_after::error_with_retry_after(
@@ -340,10 +388,21 @@ impl GeminiProvider {
                 ));
             }
 
-            return resp
-                .json()
-                .await
-                .with_context(|| format!("Failed to parse Gemini {} response", method));
+            match self.while_consumer_open(resp.json()).await? {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if policy.allows_retry_after(attempt)
+                        && is_transient_gemini_transport_error(&error) =>
+                {
+                    attempt = attempt.saturating_add(1);
+                    self.while_consumer_open(tokio::time::sleep(policy.delay(attempt, None, 1500)))
+                        .await?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to parse Gemini {} response", method));
+                }
+            }
         }
     }
 
@@ -358,33 +417,74 @@ impl GeminiProvider {
     ) -> Result<T> {
         let body_value =
             serde_json::to_value(body).context("Failed to serialize Gemini request body")?;
-        let resp = self
-            .send_with_retry(
-                |client| {
-                    client
-                        .post(url)
-                        .header("x-goog-api-key", api_key)
-                        .header(reqwest::header::CONTENT_TYPE, "application/json")
-                        .json(&body_value)
-                },
-                url,
-            )
-            .await?;
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = jcode_base::util::http_error_body(resp, "HTTP error").await;
-            anyhow::bail!(
-                "Gemini request {} failed (HTTP {}): {}",
-                label,
-                status,
-                body.trim()
-            );
+        let policy =
+            self.retry_policy((label != "generateContent").then_some(MAX_HTTP_RETRIES + 1));
+        for attempt in policy.attempts() {
+            let resp = self
+                .send_with_retry(
+                    |client| {
+                        client
+                            .post(url)
+                            .header("x-goog-api-key", api_key)
+                            .header(reqwest::header::CONTENT_TYPE, "application/json")
+                            .json(&body_value)
+                    },
+                    url,
+                )
+                .await?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let retry_after = jcode_provider_core::retry_after::retry_after(resp.headers());
+                let body = self
+                    .while_consumer_open(jcode_base::util::http_error_body(resp, "HTTP error"))
+                    .await?;
+                if let Some(delay) = gemini_http_retry_delay(
+                    policy,
+                    label,
+                    status,
+                    &body,
+                    attempt,
+                    retry_after.map(|hint| {
+                        if policy.is_unlimited() {
+                            hint.remaining_unbounded()
+                        } else {
+                            hint.remaining()
+                        }
+                    }),
+                ) {
+                    self.while_consumer_open(tokio::time::sleep(delay)).await?;
+                    continue;
+                }
+                return Err(jcode_provider_core::retry_after::error_with_retry_after(
+                    format!(
+                        "Gemini request {} failed (HTTP {}): {}",
+                        label,
+                        status,
+                        body.trim()
+                    ),
+                    retry_after,
+                ));
+            }
+            match self.while_consumer_open(resp.json()).await? {
+                Ok(response) => return Ok(response),
+                Err(error)
+                    if policy.allows_retry_after(attempt)
+                        && is_transient_gemini_transport_error(&error) =>
+                {
+                    self.while_consumer_open(tokio::time::sleep(policy.delay(
+                        attempt.saturating_add(1),
+                        None,
+                        1500,
+                    )))
+                    .await?;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("Failed to parse Gemini {} response", label));
+                }
+            }
         }
-
-        resp.json()
-            .await
-            .with_context(|| format!("Failed to parse Gemini {} response", label))
+        anyhow::bail!("Gemini request {label} exhausted its retry budget")
     }
 
     /// GET a JSON resource from the official Gemini Developer API using an
@@ -615,8 +715,9 @@ impl Provider for GeminiProvider {
         let system = system.to_string();
         let resume_session_id = resume_session_id.map(|value| value.to_string());
         let state_cache = self.state.clone();
-        let provider = self.clone();
+        let mut provider = self.clone();
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
+        provider.consumer = Some(tx.clone());
 
         tokio::spawn(async move {
             let _ = tx
@@ -636,6 +737,7 @@ impl Provider for GeminiProvider {
                     model: provider.model.clone(),
                     state: state_cache.clone(),
                     fetched_models: provider.fetched_models.clone(),
+                    consumer: provider.consumer.clone(),
                 };
                 match provider.ensure_state().await {
                     Ok(state) => state,
@@ -1031,6 +1133,7 @@ impl Provider for GeminiProvider {
             model: Arc::new(RwLock::new(self.model())),
             state: self.state.clone(),
             fetched_models: self.fetched_models.clone(),
+            consumer: self.consumer.clone(),
         })
     }
 
@@ -1047,6 +1150,7 @@ impl Clone for GeminiProvider {
             model: self.model.clone(),
             state: self.state.clone(),
             fetched_models: self.fetched_models.clone(),
+            consumer: self.consumer.clone(),
         }
     }
 }
@@ -1058,6 +1162,7 @@ fn is_vpc_sc_error(err: &anyhow::Error) -> bool {
 const MAX_HTTP_RETRIES: u32 = 5;
 
 fn gemini_http_retry_delay(
+    policy: jcode_provider_core::retry_policy::RetryPolicy,
     method: &str,
     status: reqwest::StatusCode,
     body: &str,
@@ -1066,7 +1171,9 @@ fn gemini_http_retry_delay(
 ) -> Option<Duration> {
     // Onboarding mutates account state. Do not replay it automatically when a
     // server error cannot tell us whether the first request completed.
-    if attempt >= MAX_HTTP_RETRIES || !matches!(method, "generateContent" | "loadCodeAssist") {
+    if !policy.allows_retry_after(attempt)
+        || !matches!(method, "generateContent" | "loadCodeAssist")
+    {
         return None;
     }
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -1088,11 +1195,7 @@ fn gemini_http_retry_delay(
     } else if !matches!(status.as_u16(), 500 | 502 | 503 | 504) {
         return None;
     }
-    Some(jcode_provider_core::retry_after::retry_delay(
-        attempt,
-        1500,
-        retry_after,
-    ))
+    Some(policy.delay(attempt.saturating_add(1), retry_after, 1500))
 }
 
 fn gemini_http_client() -> reqwest::Client {

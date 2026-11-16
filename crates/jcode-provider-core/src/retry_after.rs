@@ -2,24 +2,23 @@
 //!
 //! Provider runtimes keep their own retry classification and request logic, but
 //! parsing an untrusted server delay and carrying it through an `anyhow::Error`
-//! should be consistent. Delays are capped so a malformed or hostile upstream
-//! cannot stall a turn indefinitely.
+//! should be consistent. Finite retry budgets use capped hints; an explicit
+//! unlimited policy can honor a longer server reset while remaining cancellable.
 
 use anyhow::Error;
 use reqwest::header::{HeaderMap, RETRY_AFTER};
 use std::fmt;
 use std::time::{Duration, Instant, SystemTime};
 
-/// Longest server-requested delay a provider retry loop will honor.
+/// Longest server-requested delay for a finite provider retry budget.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 /// Parse a `Retry-After` header as delta-seconds or an HTTP date.
 ///
-/// Numeric values are parsed with saturation and then capped, so even an
-/// arbitrarily long digit string is safe. Invalid values are ignored and let
-/// the caller fall back to its normal exponential backoff.
+/// Numeric values use saturating parsing and checked monotonic deadlines.
+/// Invalid values are ignored; the retry policy chooses a bounded or full view.
 pub fn retry_after(headers: &HeaderMap) -> Option<RetryAfter> {
-    retry_after_delay_at(headers, SystemTime::now()).map(RetryAfter::new)
+    retry_after_raw_delay_at(headers, SystemTime::now()).map(RetryAfter::new)
 }
 
 /// Parse a bounded retry delay from a provider JSON error body.
@@ -51,7 +50,9 @@ pub fn retry_after_body_seconds(body: &str) -> Option<u64> {
 /// Body counterpart of [`retry_after`]: parse a JSON error body for a
 /// server-requested delay and wrap it as a monotonic retry hint.
 pub fn retry_after_body(body: &str) -> Option<RetryAfter> {
-    retry_after_body_delay(body).map(RetryAfter::new)
+    retry_after_body_seconds(body)
+        .map(Duration::from_secs)
+        .map(RetryAfter::new)
 }
 
 /// Depth-first search for the first numeric, positive `retry_after_seconds`.
@@ -74,33 +75,32 @@ fn positive_seconds(value: &serde_json::Value) -> Option<u64> {
     (seconds.is_finite() && seconds > 0.0).then(|| seconds.ceil() as u64)
 }
 
+#[cfg(test)]
 fn retry_after_delay_at(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
+    retry_after_raw_delay_at(headers, now).map(|delay| delay.min(MAX_RETRY_AFTER))
+}
+
+fn retry_after_raw_delay_at(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
     if value.is_empty() {
         return None;
     }
 
     if value.bytes().all(|byte| byte.is_ascii_digit()) {
-        let max_secs = MAX_RETRY_AFTER.as_secs();
         let seconds = value.bytes().fold(0u64, |seconds, byte| {
             seconds
                 .saturating_mul(10)
                 .saturating_add(u64::from(byte - b'0'))
-                .min(max_secs)
         });
         return Some(Duration::from_secs(seconds));
     }
 
     let retry_at = httpdate::parse_http_date(value).ok()?;
-    Some(
-        retry_at
-            .duration_since(now)
-            .unwrap_or(Duration::ZERO)
-            .min(MAX_RETRY_AFTER),
-    )
+    Some(retry_at.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
-/// A bounded server retry hint represented as a monotonic deadline.
+/// A server retry hint represented as a monotonic deadline. Finite budgets
+/// use a bounded view; unlimited budgets can honor the actual reset time.
 #[derive(Clone, Copy, Debug)]
 pub struct RetryAfter {
     deadline: Instant,
@@ -108,14 +108,27 @@ pub struct RetryAfter {
 
 impl RetryAfter {
     fn new(delay: Duration) -> Self {
+        let now = Instant::now();
         Self {
-            deadline: Instant::now() + delay,
+            deadline: now.checked_add(delay).unwrap_or(now + MAX_RETRY_AFTER),
         }
+    }
+
+    /// Carry a stream error's delay through the same validated monotonic hint
+    /// used for HTTP Retry-After headers. Unrepresentable delays fall back to
+    /// the finite safety cap instead of overflowing the clock.
+    pub fn from_delay(delay: Duration) -> Self {
+        Self::new(delay)
     }
 
     /// Time still remaining on the hint. Time spent reading and classifying an
     /// error response counts toward the requested wait.
     pub fn remaining(self) -> Duration {
+        self.remaining_unbounded().min(MAX_RETRY_AFTER)
+    }
+
+    /// The server-requested remaining delay for an unlimited, cancellable wait.
+    pub fn remaining_unbounded(self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now())
     }
 }
@@ -155,6 +168,13 @@ pub fn retry_after_from_error(error: &Error) -> Option<Duration> {
         .chain()
         .find_map(|source| source.downcast_ref::<RetryAfterError>())
         .map(|error| error.retry_after.remaining())
+}
+
+pub fn retry_after_unbounded_from_error(error: &Error) -> Option<Duration> {
+    error
+        .chain()
+        .find_map(|source| source.downcast_ref::<RetryAfterError>())
+        .map(|error| error.retry_after.remaining_unbounded())
 }
 
 /// Select the delay before a retry, preferring a validated server hint over

@@ -72,30 +72,33 @@ pub(super) async fn run_stream_with_retries(
     let mut last_error = None;
     let mut next_retry_delay = None;
     let config = jcode_base::config::config();
-    let max_retries = config.provider.max_retries.max(1);
-    let retry_backoff_cap =
-        std::time::Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1));
+    let policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+        config.provider.max_retries,
+        std::time::Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1)),
+    );
+    let max_retries = policy.max_attempts();
 
-    for attempt in 0..max_retries {
+    for attempt in policy.attempts() {
+        if tx.is_closed() {
+            return;
+        }
         if attempt > 0 {
-            let delay = jcode_provider_core::retry_after::retry_delay(
-                attempt,
-                RETRY_BASE_DELAY_MS,
-                next_retry_delay.take(),
-            )
-            .min(retry_backoff_cap);
-            tokio::time::sleep(delay).await;
+            let delay = policy.delay(attempt, next_retry_delay.take(), RETRY_BASE_DELAY_MS);
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
             jcode_base::logging::info(&format!(
                 "Retrying API request using {} (attempt {}/{})",
                 auth.label(),
-                attempt + 1,
+                attempt.saturating_add(1),
                 max_retries
             ));
         }
 
         jcode_base::logging::info(&format!(
             "API stream attempt {}/{} over HTTPS transport (model: {}, endpoint: {}, auth: {})",
-            attempt + 1,
+            attempt.saturating_add(1),
             max_retries,
             model,
             api_base,
@@ -119,7 +122,9 @@ pub(super) async fn run_stream_with_retries(
             jcode_provider_core::fresh_transport_client()
         };
 
-        match stream_response(
+        let result = tokio::select! {
+            _ = tx.closed() => return,
+            result = stream_response(
             attempt_client,
             api_base.clone(),
             auth.clone(),
@@ -131,9 +136,9 @@ pub(super) async fn run_stream_with_retries(
             Arc::clone(&provider_pin),
             model.clone(),
             responses_api,
-        )
-        .await
-        {
+            ) => result,
+        };
+        match result {
             Ok(()) => {
                 let _ = attempt_guard.finish().await;
                 return;
@@ -142,7 +147,7 @@ pub(super) async fn run_stream_with_retries(
                 let saw_output = attempt_guard.finish().await;
                 // Full anyhow chain ({:#}) so a `.context(...)`-wrapped transport
                 // cause (e.g. TLS BadRecordMac) is visible to the classifier.
-                if retryable_stream_failure(&e) && attempt + 1 < max_retries {
+                if retryable_stream_failure(&e) && policy.allows_retry_after(attempt) {
                     if saw_output {
                         // Partial output already reached the consumer; tell it
                         // to discard the partial attempt so the retried
@@ -153,7 +158,7 @@ pub(super) async fn run_stream_with_retries(
                         ));
                         let _ = tx
                             .send(Ok(StreamEvent::RetryRollback {
-                                attempt: attempt + 2,
+                                attempt: attempt.saturating_add(2),
                                 max: max_retries,
                             }))
                             .await;
@@ -163,7 +168,7 @@ pub(super) async fn run_stream_with_retries(
                             e
                         ));
                     }
-                    next_retry_delay = jcode_provider_core::retry_after::retry_after_from_error(&e);
+                    next_retry_delay = policy.retry_after_from_error(&e);
                     last_error = Some(e);
                     continue;
                 }
@@ -436,26 +441,29 @@ fn responses_stream_failure(
     // The shared Responses parser preserves error type/code in the message.
     // Permanent failures must win even if their prose mentions a timeout or
     // overload, or the server supplies a retry hint.
-    let permanent = [
-        "invalid_request",
-        "invalid_argument",
-        "content_filter",
-        "content_policy",
-        "authentication",
-        "permission_denied",
-        "insufficient_quota",
-        "billing",
-        "unauthorized",
-        "forbidden",
-        "model_not_found",
-        "deployment_not_found",
-        "tool argument snapshot differs",
-        "unsafe_to_replay",
-        "invalid api key",
-        "invalid x-api-key",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker));
+    let permanent = jcode_provider_core::is_definitive_usage_exhaustion(&lower)
+        || [
+            "invalid_request",
+            "invalid_argument",
+            "content_filter",
+            "content_policy",
+            "authentication",
+            "permission_denied",
+            "insufficient_quota",
+            "quota_exhausted",
+            "daily quota",
+            "billing",
+            "unauthorized",
+            "forbidden",
+            "model_not_found",
+            "deployment_not_found",
+            "tool argument snapshot differs",
+            "unsafe_to_replay",
+            "invalid api key",
+            "invalid x-api-key",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
     let transient = [
         "rate_limit",
         "rate limit",
@@ -468,10 +476,10 @@ fn responses_stream_failure(
     .iter()
     .any(|marker| lower.contains(marker))
         || jcode_provider_core::is_transient_transport_error(&lower);
-    let retry_after = retry_after_secs.and_then(|seconds| {
-        jcode_provider_core::retry_after::retry_after_body(
-            &serde_json::json!({"retry_after_seconds": seconds}).to_string(),
-        )
+    let retry_after = retry_after_secs.map(|seconds| {
+        jcode_provider_core::retry_after::RetryAfter::from_delay(std::time::Duration::from_secs(
+            seconds,
+        ))
     });
     anyhow::Error::new(AzureResponseFailure {
         retryable: !permanent && (transient || retry_after.is_some()),
@@ -504,6 +512,13 @@ fn parsed_http_status(error_str: &str) -> Option<u16> {
 }
 
 fn is_retryable_error(error_str: &str) -> bool {
+    if jcode_provider_core::is_definitive_usage_exhaustion(error_str)
+        || ["quota_exhausted", "daily quota", "billing"]
+            .iter()
+            .any(|marker| error_str.contains(marker))
+    {
+        return false;
+    }
     // Explicit non-retryable HTTP statuses take precedence over the loose
     // substring heuristics below. These are deterministic client-side failures
     // (auth, billing, malformed request) where retrying is futile and just

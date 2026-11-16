@@ -286,7 +286,11 @@ pub(crate) async fn stream_response(
                 if matches!(event, StreamEvent::MessageEnd { .. }) {
                     saw_message_end = true;
                 }
-                if let StreamEvent::Error { message, .. } = &event {
+                if let StreamEvent::Error {
+                    message,
+                    retry_after_secs,
+                } = &event
+                {
                     if let Some(model_name) = request.get("model").and_then(|m| m.as_str()) {
                         maybe_record_runtime_model_unavailable_from_stream_error(
                             &catalog_scope,
@@ -307,11 +311,16 @@ pub(crate) async fn stream_response(
                                 ),
                             ],
                         );
-                        return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
-                            "Stream error: {}",
-                            message
+                        return Err(OpenAIStreamFailure::Other(stream_event_error(
+                            message,
+                            *retry_after_secs,
                         )));
                     }
+                    // A permanent SSE error is a terminal response, even if
+                    // the server never sends response.completed. Do not turn
+                    // its EOF into a retryable transport fault.
+                    let _ = tx.send(Ok(event)).await;
+                    return Ok(());
                 }
                 usage_recorder.observe(&event).await;
                 if tx.send(Ok(event)).await.is_err() {

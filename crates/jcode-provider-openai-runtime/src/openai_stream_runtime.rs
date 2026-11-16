@@ -108,14 +108,15 @@ fn opaque_rejection_requires_exact_shape_and_no_response_activity() {
     }
 }
 
-/// This is intentionally outside the generic retry loop. Even a transient
-/// failure of this single HTTPS attempt must not schedule another replay.
+/// Probe an opaque WebSocket rejection once over HTTPS. Permanent validation
+/// failures are forwarded once; a transient HTTPS failure returns to the
+/// configured request retry loop without replaying the rejected WebSocket.
 pub(super) async fn recover_opaque_ws_rejection(
     credentials: Arc<RwLock<CodexCredentials>>,
     account_label: Option<String>,
     request: Value,
     tx: &mpsc::Sender<Result<StreamEvent>>,
-) {
+) -> Result<()> {
     emit_status_detail(tx, "opaque websocket rejection: trying HTTPS once").await;
     jcode_base::logging::warn(
         "OpenAI opaque websocket rejection before response: one full-request HTTPS recovery",
@@ -132,24 +133,28 @@ pub(super) async fn recover_opaque_ws_rejection(
     tokio::pin!(recovery);
     let mut failed = false;
     let mut failure_detail = None;
+    let mut failure_error = None;
     let mut retry_after_secs = None;
     let mut finished = false;
     loop {
         tokio::select! {
-            _ = tx.closed() => return,
+            _ = tx.closed() => return Ok(()),
             result = &mut recovery, if !finished => {
                 if let Err(error) = result {
                     failed = true;
-                    failure_detail = Some(match error {
-                        OpenAIStreamFailure::Other(error) | OpenAIStreamFailure::FallbackToHttps(error) => format!("{error:#}"),
-                        OpenAIStreamFailure::OpaqueWsRejection => "invalid_request_error: Invalid request".into(),
-                    });
+                    let error = match error {
+                        OpenAIStreamFailure::Other(error) | OpenAIStreamFailure::FallbackToHttps(error) => error,
+                        OpenAIStreamFailure::OpaqueWsRejection => anyhow::anyhow!("invalid_request_error: Invalid request"),
+                    };
+                    failure_detail = Some(format!("{error:#}"));
+                    failure_error = Some(error);
                 }
                 finished = true;
             }
             event = recovery_rx.recv() => match event {
                 Some(Ok(StreamEvent::Error { message, retry_after_secs: retry_after })) => {
                     failed = true;
+                    failure_error = Some(stream_event_error(&message, retry_after));
                     failure_detail = Some(message);
                     retry_after_secs = retry_after;
                     break;
@@ -157,9 +162,10 @@ pub(super) async fn recover_opaque_ws_rejection(
                 Some(Err(error)) => {
                     failed = true;
                     failure_detail = Some(error.to_string());
+                    failure_error = Some(error);
                     break;
                 },
-                Some(event) => { if tx.send(event).await.is_err() { return; } }
+                Some(event) => { if tx.send(event).await.is_err() { return Ok(()); } }
                 None => break,
             }
         }
@@ -170,6 +176,11 @@ pub(super) async fn recover_opaque_ws_rejection(
         failure_detail.as_deref().unwrap_or("none")
     ));
     if failed {
+        if let Some(error) = failure_error {
+            if is_retryable_error(&format!("{error:#}").to_ascii_lowercase()) {
+                return Err(error);
+            }
+        }
         emit_status_detail(tx, "opaque websocket rejection: HTTPS recovery failed").await;
         let _ = tx
             .send(Ok(StreamEvent::Error {
@@ -181,6 +192,18 @@ pub(super) async fn recover_opaque_ws_rejection(
             }))
             .await;
     }
+    Ok(())
+}
+
+/// Carry a server's stream-level retry hint through the request retry loop.
+pub(super) fn stream_event_error(message: &str, retry_after_secs: Option<u64>) -> anyhow::Error {
+    let hint = retry_after_secs.map(|seconds| {
+        jcode_provider_core::retry_after::RetryAfter::from_delay(Duration::from_secs(seconds))
+    });
+    jcode_provider_core::retry_after::error_with_retry_after(
+        format!("Stream error: {message}"),
+        hint,
+    )
 }
 
 /// Usage of the account these credentials authenticate as, plus its label for
@@ -476,7 +499,7 @@ pub(super) enum PersistentWsResult {
     /// A terminal API error was forwarded to the consumer. Do not replay it.
     TerminalError,
     NotAvailable,
-    Failed(String),
+    Failed(anyhow::Error),
 }
 
 /// Try to continue a conversation on an existing persistent WebSocket connection
@@ -905,7 +928,7 @@ async fn continue_persistent_ws_locked(
         // only its transport, never its server-side conversation context.
         continuation_request = request.clone();
         let Some(object) = continuation_request.as_object_mut() else {
-            return PersistentWsResult::Failed("invalid full replay request".into());
+            return PersistentWsResult::Failed(anyhow::Error::msg("invalid full replay request"));
         };
         object.insert("type".into(), serde_json::json!("response.create"));
         object.insert("input".into(), Value::Array(input.to_vec()));
@@ -1022,7 +1045,12 @@ async fn continue_persistent_ws_locked(
 
     let request_text = match serde_json::to_string(&continuation_request) {
         Ok(t) => t,
-        Err(e) => return PersistentWsResult::Failed(format!("serialize error: {}", e)),
+        Err(e) => {
+            return PersistentWsResult::Failed(anyhow::Error::msg(format!(
+                "serialize error: {}",
+                e
+            )));
+        }
     };
 
     let _ = tx
@@ -1057,7 +1085,7 @@ async fn continue_persistent_ws_locked(
     )
     .await
     {
-        return PersistentWsResult::Failed(format!("send error: {}", e));
+        return PersistentWsResult::Failed(anyhow::Error::msg(format!("send error: {}", e)));
     }
     drop(send_credentials);
     *recovery_phase = RecoveryPhase::InFlight;
@@ -1098,7 +1126,7 @@ async fn continue_persistent_ws_locked(
         ) {
             Some(timeout_secs) => timeout_secs,
             None => {
-                return PersistentWsResult::Failed(format!(
+                return PersistentWsResult::Failed(anyhow::Error::msg(format!(
                     "timed out waiting for {} websocket activity on persistent WS ({}s; {})",
                     websocket_activity_timeout_kind(saw_api_activity),
                     if saw_api_activity {
@@ -1111,7 +1139,7 @@ async fn continue_persistent_ws_locked(
                         stream_started,
                         last_api_activity_at
                     ),
-                ));
+                )));
             }
         };
         let next_item =
@@ -1120,7 +1148,7 @@ async fn continue_persistent_ws_locked(
             {
                 Ok(item) => item,
                 Err(_) => {
-                    return PersistentWsResult::Failed(format!(
+                    return PersistentWsResult::Failed(anyhow::Error::msg(format!(
                         "timed out waiting for {} websocket activity on persistent WS ({}s; {})",
                         websocket_activity_timeout_kind(saw_api_activity),
                         timeout_secs,
@@ -1129,7 +1157,7 @@ async fn continue_persistent_ws_locked(
                             stream_started,
                             last_api_activity_at
                         ),
-                    ));
+                    )));
                 }
             };
 
@@ -1137,9 +1165,9 @@ async fn continue_persistent_ws_locked(
             if saw_response_completed {
                 break;
             }
-            return PersistentWsResult::Failed(
+            return PersistentWsResult::Failed(anyhow::Error::msg(
                 "persistent WS stream ended before response.completed".to_string(),
-            );
+            ));
         };
 
         match result {
@@ -1166,7 +1194,9 @@ async fn continue_persistent_ws_locked(
                     logged_first_server_event = true;
                 }
                 if is_websocket_fallback_notice(&text) {
-                    return PersistentWsResult::Failed("server requested fallback".to_string());
+                    return PersistentWsResult::Failed(anyhow::Error::msg(
+                        "server requested fallback".to_string(),
+                    ));
                 }
 
                 let mut made_api_activity = if saw_api_activity {
@@ -1217,15 +1247,19 @@ async fn continue_persistent_ws_locked(
                     if matches!(event, StreamEvent::MessageEnd { .. }) {
                         saw_response_completed = true;
                     }
-                    if let StreamEvent::Error { ref message, .. } = event {
+                    if let StreamEvent::Error {
+                        ref message,
+                        retry_after_secs,
+                    } = event
+                    {
                         let lower = message.to_lowercase();
                         if is_retryable_error(&lower)
                             || lower.contains("previous_response_not_found")
                             || lower.contains("no tool output found for function call")
                         {
-                            return PersistentWsResult::Failed(format!(
-                                "stream error: {}",
-                                message
+                            return PersistentWsResult::Failed(stream_event_error(
+                                message,
+                                retry_after_secs,
                             ));
                         }
                         // A failed response will not send response.completed.
@@ -1242,15 +1276,19 @@ async fn continue_persistent_ws_locked(
                 }
                 while let Some(mut event) = pending.pop_front() {
                     bind_requested_service_tier(&mut event, &requested_tier);
-                    if let StreamEvent::Error { ref message, .. } = event {
+                    if let StreamEvent::Error {
+                        ref message,
+                        retry_after_secs,
+                    } = event
+                    {
                         let lower = message.to_lowercase();
                         if is_retryable_error(&lower)
                             || lower.contains("previous_response_not_found")
                             || lower.contains("no tool output found for function call")
                         {
-                            return PersistentWsResult::Failed(format!(
-                                "stream error: {}",
-                                message
+                            return PersistentWsResult::Failed(stream_event_error(
+                                message,
+                                retry_after_secs,
                             ));
                         }
                         let _ = tx.send(Ok(event)).await;
@@ -1289,7 +1327,9 @@ async fn continue_persistent_ws_locked(
                 )
                 .await
                 {
-                    return PersistentWsResult::Failed(format!("pong send error: {error}"));
+                    return PersistentWsResult::Failed(anyhow::Error::msg(format!(
+                        "pong send error: {error}"
+                    )));
                 }
                 state.last_activity_at = Instant::now();
             }
@@ -1297,11 +1337,13 @@ async fn continue_persistent_ws_locked(
                 if saw_response_completed {
                     break;
                 }
-                return PersistentWsResult::Failed("server closed connection".to_string());
+                return PersistentWsResult::Failed(anyhow::Error::msg(
+                    "server closed connection".to_string(),
+                ));
             }
             Ok(WsMessage::Pong(_)) | Ok(_) => {}
             Err(e) => {
-                return PersistentWsResult::Failed(format!("ws error: {}", e));
+                return PersistentWsResult::Failed(anyhow::Error::msg(format!("ws error: {}", e)));
             }
         }
     }
@@ -1726,7 +1768,11 @@ async fn stream_response_websocket_authenticated(
                         if matches!(event, StreamEvent::MessageEnd { .. }) {
                             saw_response_completed = true;
                         }
-                        if let StreamEvent::Error { message, .. } = &event {
+                        if let StreamEvent::Error {
+                            message,
+                            retry_after_secs,
+                        } = &event
+                        {
                             if let Some(model_name) = request_model.as_deref() {
                                 maybe_record_runtime_model_unavailable_from_stream_error(
                                     &catalog_scope,
@@ -1735,9 +1781,9 @@ async fn stream_response_websocket_authenticated(
                                 );
                             }
                             if is_retryable_error(&message.to_lowercase()) {
-                                return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
-                                    "Stream error: {}",
-                                    message
+                                return Err(OpenAIStreamFailure::Other(stream_event_error(
+                                    message,
+                                    *retry_after_secs,
                                 )));
                             }
                             // A failed response never sends response.completed,
@@ -1768,7 +1814,11 @@ async fn stream_response_websocket_authenticated(
                         if is_stream_activity_event(&event) {
                             made_api_activity = true;
                         }
-                        if let StreamEvent::Error { message, .. } = &event {
+                        if let StreamEvent::Error {
+                            message,
+                            retry_after_secs,
+                        } = &event
+                        {
                             if let Some(model_name) = request_model.as_deref() {
                                 maybe_record_runtime_model_unavailable_from_stream_error(
                                     &catalog_scope,
@@ -1777,9 +1827,9 @@ async fn stream_response_websocket_authenticated(
                                 );
                             }
                             if is_retryable_error(&message.to_lowercase()) {
-                                return Err(OpenAIStreamFailure::Other(anyhow::anyhow!(
-                                    "Stream error: {}",
-                                    message
+                                return Err(OpenAIStreamFailure::Other(stream_event_error(
+                                    message,
+                                    *retry_after_secs,
                                 )));
                             }
                             let _ = tx.send(Ok(event)).await;
@@ -1982,6 +2032,82 @@ fn classify_unavailable_model_error(status: StatusCode, body: &str) -> Option<St
 
 /// Check if an error is transient and should be retried
 pub(super) fn is_retryable_error(error_str: &str) -> bool {
+    // Explicit in-place credential rotation reconnects with a new credential.
+    // Deterministic failures otherwise win over any
+    // incidental timeout/overload/rate-limit wording in the same error.
+    if error_str.contains("openai token refreshed, retrying")
+        || error_str.contains("openai credentials changed before request, retrying")
+    {
+        return true;
+    }
+    const PERMANENT: &[&str] = &[
+        "unauthorized",
+        "forbidden",
+        "invalid api key",
+        "invalid_api_key",
+        "invalid x-api-key",
+        "authentication_error",
+        "permission_denied",
+        "invalid_grant",
+        "refresh token has been revoked",
+        "refresh token is revoked",
+        "refresh token already used",
+        "refresh_token_reused",
+        "refresh token expired",
+        "insufficient_quota",
+        "usage_limit",
+        "usage limit",
+        "exceeded your current quota",
+        "insufficient credits",
+        "credit balance",
+        "billing_hard_limit",
+        "billing_not_active",
+        "quota exhausted",
+        "invalid_request_error",
+        "invalid_function_parameters",
+        "invalid schema",
+        "invalid tool",
+        "context_length_exceeded",
+        "maximum context length",
+        "context window exceeded",
+        "string_above_max_length",
+        "model_not_found",
+        "model_not_supported",
+        "unsupported model",
+        "content_policy_violation",
+        "safety_violation",
+        "cancelled",
+        "canceled",
+        "interrupted by user",
+    ];
+    if PERMANENT.iter().any(|marker| error_str.contains(marker)) {
+        return false;
+    }
+    if [400, 401, 403, 404, 405, 410, 413, 415, 422]
+        .iter()
+        .any(|status| {
+            [
+                "api error ",
+                "http ",
+                "http status ",
+                "status ",
+                "status: ",
+                "status=",
+            ]
+            .iter()
+            .any(|prefix| {
+                let marker = format!("{prefix}{status}");
+                error_str.match_indices(&marker).any(|(start, _)| {
+                    error_str[start + marker.len()..]
+                        .chars()
+                        .next()
+                        .is_none_or(|after| !after.is_ascii_digit())
+                })
+            })
+        })
+    {
+        return false;
+    }
     // Shared transport-layer classifier used by every other provider. This
     // covers transient TLS/network faults (connection reset/closed/refused/
     // aborted, broken pipe, timeouts, unexpected EOF, error decoding/reading,
@@ -2002,6 +2128,9 @@ pub(super) fn is_retryable_error(error_str: &str) -> bool {
         || error_str.contains("503 service unavailable")
         || error_str.contains("504 gateway timeout")
         || error_str.contains("overloaded")
+        || error_str.contains("service_unavailable")
+        || error_str.contains("gateway_timeout")
+        || error_str.contains("too_many_requests")
         // Rate limiting (429): transient, recovers on retry. Unified with the
         // other providers (Anthropic/Copilot) which already retry these.
         || error_str.contains("429 too many requests")

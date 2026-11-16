@@ -8,6 +8,17 @@ async fn opaque_recovery_public_case(
     http_failure: bool,
     cancel: bool,
 ) {
+    opaque_recovery_case(persistent, prefix, specific, http_failure, cancel, None).await;
+}
+
+async fn opaque_recovery_case(
+    persistent: bool,
+    prefix: Option<Value>,
+    specific: bool,
+    http_failure: bool,
+    cancel: bool,
+    compaction_chars: Option<usize>,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let _env_lock = jcode_base::storage::lock_test_env();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
@@ -88,6 +99,45 @@ async fn opaque_recovery_public_case(
             let serialized = http["input"].to_string();
             assert!(serialized.contains("encrypted-history"));
             assert!(serialized.contains("retained tool output"));
+            if let Some(compaction_chars) = compaction_chars {
+                let items = http["input"].as_array().unwrap();
+                let compacted: Vec<_> = items
+                    .iter()
+                    .filter(|item| item["type"] == "compaction")
+                    .collect();
+                assert_eq!(compacted.len(), 1, "native state must be replayed once");
+                assert_eq!(
+                    compacted[0]["encrypted_content"].as_str().unwrap().len(),
+                    compaction_chars,
+                );
+                let calls: Vec<_> = items
+                    .iter()
+                    .filter(|item| item["type"] == "function_call")
+                    .collect();
+                assert_eq!(calls.len(), 1, "retained tool call must not be duplicated");
+                assert_eq!(calls[0]["call_id"], "call_history");
+                assert_eq!(calls[0]["name"], "read");
+                let outputs: Vec<_> = items
+                    .iter()
+                    .filter(|item| item["type"] == "function_call_output")
+                    .collect();
+                assert_eq!(outputs.len(), 1, "retained output must not be duplicated");
+                assert_eq!(outputs[0]["call_id"], "call_history");
+                assert_eq!(outputs[0]["output"], "retained tool output");
+                assert_eq!(items.last().unwrap()["content"][0]["text"], "next");
+                if persistent {
+                    // The WS continuation omits the already accepted prefix;
+                    // HTTPS recovery must reconstruct it from the full request.
+                    assert_eq!(wire["previous_response_id"], "resp_previous");
+                    assert!(
+                        wire["input"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .all(|item| item["type"] != "compaction")
+                    );
+                }
+            }
             if !persistent {
                 let mut expected = wire.clone();
                 expected.as_object_mut().unwrap().remove("type");
@@ -131,19 +181,32 @@ async fn opaque_recovery_public_case(
     *provider.credentials.write().await = prewarm_test_credentials();
     provider.set_model("gpt-5.6-sol").unwrap();
     provider.set_transport("websocket").unwrap();
-    let messages = vec![
-        ChatMessage::user("original"),
-        ChatMessage {
-            role: Role::Assistant,
-            content: vec![ContentBlock::OpenAIReasoning {
-                id: "rs_history".into(),
-                summary: vec!["prior thought".into()],
-                encrypted_content: Some("encrypted-history".into()),
-                status: Some("completed".into()),
-            }],
+    let mut messages = if let Some(compaction_chars) = compaction_chars {
+        let mut encrypted_content = "encrypted-history".repeat(compaction_chars.div_ceil(17));
+        encrypted_content.truncate(compaction_chars);
+        vec![ChatMessage {
+            role: Role::User,
+            content: vec![ContentBlock::OpenAICompaction { encrypted_content }],
             timestamp: None,
             tool_duration_ms: None,
-        },
+        }]
+    } else {
+        vec![
+            ChatMessage::user("original"),
+            ChatMessage {
+                role: Role::Assistant,
+                content: vec![ContentBlock::OpenAIReasoning {
+                    id: "rs_history".into(),
+                    summary: vec!["prior thought".into()],
+                    encrypted_content: Some("encrypted-history".into()),
+                    status: Some("completed".into()),
+                }],
+                timestamp: None,
+                tool_duration_ms: None,
+            },
+        ]
+    };
+    messages.extend([
         assistant_tool_use(
             "call_history",
             "read",
@@ -151,7 +214,7 @@ async fn opaque_recovery_public_case(
         ),
         ChatMessage::tool_result("call_history", "retained tool output", false),
         ChatMessage::user("next"),
-    ];
+    ]);
     if persistent {
         let (ws_stream, _) = connect_ws(format!("ws://{addr}/v1/responses"))
             .await
@@ -239,6 +302,23 @@ async fn opaque_recovery_fresh_success() {
 #[tokio::test]
 async fn opaque_recovery_persistent_success() {
     opaque_recovery_public_case(true, None, false, false, false).await;
+}
+
+#[tokio::test]
+async fn opaque_recovery_native_compaction_fresh_preserves_tool_tail() {
+    // Match the affected session's payload size. This stays entirely on
+    // loopback and must survive unchanged through the HTTPS fallback.
+    opaque_recovery_case(false, None, false, false, false, Some(6_408_120)).await;
+}
+
+#[tokio::test]
+async fn opaque_recovery_native_compaction_persistent_restores_prefix() {
+    opaque_recovery_case(true, None, false, false, false, Some(64_000)).await;
+}
+
+#[tokio::test]
+async fn opaque_recovery_native_compaction_rejection_remains_bounded() {
+    opaque_recovery_case(false, None, false, true, false, Some(64_000)).await;
 }
 #[tokio::test]
 async fn opaque_recovery_repeated_rejection_bounded() {

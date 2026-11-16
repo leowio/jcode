@@ -1294,7 +1294,9 @@ pub struct ProviderConfig {
     /// Default: 180. Overridable via `JCODE_STREAM_IDLE_TIMEOUT_SECS`.
     pub stream_idle_timeout_secs: u64,
     /// Maximum request attempts for transient provider errors, including the
-    /// initial attempt. Default: 8. Overridable via `JCODE_MAX_RETRIES`.
+    /// initial attempt. `4294967295` (`u32::MAX`) retries indefinitely until
+    /// success, cancellation, or a permanent error. Default: 8.
+    /// Overridable via `JCODE_MAX_RETRIES`.
     pub max_retries: u32,
     /// Maximum exponential-backoff delay between transient-error retries.
     /// Default: 30 seconds. Overridable via `JCODE_RETRY_BACKOFF_CAP_SECS`.

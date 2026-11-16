@@ -231,7 +231,8 @@ impl Agent {
             let mut keepalive = stream_keepalive_ticker();
             let mut stream = {
                 provider.set_session_id(&self.session.id);
-                let mut complete_future = std::pin::pin!(provider.complete_split(
+                let mut complete_future = std::pin::pin!(super::provider_retry::complete_split(
+                    Arc::clone(&provider),
                     send_messages,
                     &tools,
                     &split_prompt.static_part,

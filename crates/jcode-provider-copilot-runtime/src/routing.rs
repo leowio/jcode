@@ -34,12 +34,38 @@ pub(crate) fn copilot_api_path(uses_responses_api: bool) -> &'static str {
 }
 
 pub(crate) fn is_retryable_error(error_str: &str) -> bool {
+    if jcode_provider_core::is_definitive_usage_exhaustion(error_str)
+        || [
+            "quota_exhausted",
+            "daily quota",
+            "billing",
+            "invalid_request_error",
+            "invalid_api_key",
+            "unauthorized",
+            "forbidden",
+            "content_policy_violation",
+            "context_length_exceeded",
+            "invalid_function_parameters",
+        ]
+        .iter()
+        .any(|marker| error_str.contains(marker))
+        || [
+            "http 400", "http 401", "http 402", "http 403", "http 404", "http 422",
+        ]
+        .iter()
+        .any(|marker| error_str.contains(marker))
+    {
+        return false;
+    }
     jcode_provider_core::is_transient_transport_error(error_str)
         || error_str.contains("500 internal server error")
         || error_str.contains("502 bad gateway")
         || error_str.contains("503 service unavailable")
         || error_str.contains("504 gateway timeout")
         || error_str.contains("overloaded")
+        || error_str.contains("server_error")
+        || error_str.contains("service_unavailable")
+        || error_str.contains("api_error")
         || error_str.contains("429 too many requests")
         || error_str.contains("rate limit")
         || error_str.contains("rate_limit")

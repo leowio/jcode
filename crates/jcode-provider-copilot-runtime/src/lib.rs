@@ -421,6 +421,24 @@ impl CopilotApiProvider {
         is_user_initiated: bool,
         tx: mpsc::Sender<Result<StreamEvent>>,
     ) {
+        self.stream_request_at(
+            body,
+            uses_responses_api,
+            is_user_initiated,
+            tx,
+            copilot_auth::COPILOT_API_BASE,
+        )
+        .await;
+    }
+
+    async fn stream_request_at(
+        &self,
+        body: Value,
+        uses_responses_api: bool,
+        is_user_initiated: bool,
+        tx: mpsc::Sender<Result<StreamEvent>>,
+        api_base: &str,
+    ) {
         use jcode_message_types::ConnectionPhase;
 
         self.wait_for_init().await;
@@ -431,32 +449,41 @@ impl CopilotApiProvider {
             .clone();
         let initiator = if is_user_initiated { "user" } else { "agent" };
 
-        const MAX_RETRIES: u32 = 3;
+        let config = jcode_base::config::config();
+        let policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+            config.provider.max_retries,
+            std::time::Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1)),
+        );
+        let max_retries = policy.max_attempts();
         const RETRY_BASE_DELAY_MS: u64 = 1000;
         let mut last_error: Option<anyhow::Error> = None;
         let mut attempted_auth_refresh = false;
+        let mut next_retry_delay = None;
 
-        for attempt in 0..MAX_RETRIES {
+        for attempt in policy.attempts() {
+            if tx.is_closed() {
+                return;
+            }
             if attempt > 0 {
-                let delay = jcode_provider_core::attempt_tracker::retry_backoff_delay(
-                    attempt,
-                    RETRY_BASE_DELAY_MS,
-                );
+                let delay = policy.delay(attempt, next_retry_delay.take(), RETRY_BASE_DELAY_MS);
                 jcode_base::logging::info(&format!(
                     "Retrying Copilot API request (attempt {}/{}) after {}ms",
-                    attempt + 1,
-                    MAX_RETRIES,
+                    attempt.saturating_add(1),
+                    max_retries,
                     delay.as_millis()
                 ));
                 let _ = tx
                     .send(Ok(StreamEvent::ConnectionPhase {
                         phase: ConnectionPhase::Retrying {
-                            attempt: attempt + 1,
-                            max: MAX_RETRIES,
+                            attempt: attempt.saturating_add(1),
+                            max: max_retries,
                         },
                     }))
                     .await;
-                tokio::time::sleep(delay).await;
+                tokio::select! {
+                    _ = tx.closed() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
             }
 
             jcode_base::logging::info(&format!(
@@ -485,10 +512,10 @@ impl CopilotApiProvider {
                 jcode_provider_core::fresh_transport_client()
             };
 
-            let resp = attempt_client
+            let request = attempt_client
                 .post(format!(
                     "{}/{}",
-                    copilot_auth::COPILOT_API_BASE,
+                    api_base,
                     copilot_api_path(uses_responses_api)
                 ))
                 .header("Authorization", format!("Bearer {}", bearer_token))
@@ -507,8 +534,11 @@ impl CopilotApiProvider {
                 .header("Vscode-Sessionid", &self.session_id)
                 .header("Vscode-Machineid", &self.machine_id)
                 .json(&body)
-                .send()
-                .await;
+                .send();
+            let resp = tokio::select! {
+                _ = tx.closed() => return,
+                response = request => response,
+            };
 
             let resp = match resp {
                 Ok(r) => r,
@@ -517,7 +547,7 @@ impl CopilotApiProvider {
                     // transport cause (e.g. TLS BadRecordMac) is visible to the
                     // retry classifier.
                     let error_str = format!("{e:#}").to_lowercase();
-                    if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                    if is_retryable_error(&error_str) && policy.allows_retry_after(attempt) {
                         jcode_base::logging::info(&format!(
                             "Transient Copilot error, will retry: {}",
                             e
@@ -533,6 +563,7 @@ impl CopilotApiProvider {
             };
 
             let status = resp.status();
+            let retry_after = jcode_provider_core::retry_after::retry_after(resp.headers());
 
             // On auth error, invalidate token and retry once
             if Self::is_auth_error(status) && !attempted_auth_refresh {
@@ -544,14 +575,24 @@ impl CopilotApiProvider {
             }
 
             if !status.is_success() {
-                let body_text = jcode_base::util::http_error_body(resp, "HTTP error").await;
+                let body_text = tokio::select! {
+                    _ = tx.closed() => return,
+                    text = jcode_base::util::http_error_body(resp, "HTTP error") => text,
+                };
                 let error_str =
                     format!("Copilot API error (HTTP {}): {}", status, body_text).to_lowercase();
-                if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                if is_retryable_error(&error_str) && policy.allows_retry_after(attempt) {
                     jcode_base::logging::info(&format!(
                         "Retryable Copilot HTTP error: {}",
                         error_str
                     ));
+                    next_retry_delay = retry_after.map(|hint| {
+                        if policy.is_unlimited() {
+                            hint.remaining_unbounded()
+                        } else {
+                            hint.remaining()
+                        }
+                    });
                     last_error = Some(anyhow::anyhow!(
                         "Copilot API error (HTTP {}): {}",
                         status,
@@ -583,10 +624,16 @@ impl CopilotApiProvider {
                 jcode_provider_core::attempt_tracker::track_attempt_output(tx.clone());
 
             // Process SSE stream - returns Err on timeout/stream errors
-            let stream_result = if uses_responses_api {
-                self.process_responses_sse_stream(resp, attempt_tx).await
-            } else {
-                self.process_sse_stream(resp, attempt_tx).await
+            let stream_operation = async {
+                if uses_responses_api {
+                    self.process_responses_sse_stream(resp, attempt_tx).await
+                } else {
+                    self.process_sse_stream(resp, attempt_tx).await
+                }
+            };
+            let stream_result = tokio::select! {
+                _ = tx.closed() => return,
+                result = stream_operation => result,
             };
             match stream_result {
                 Ok(()) => {
@@ -599,31 +646,32 @@ impl CopilotApiProvider {
                     // transport cause (e.g. TLS BadRecordMac) is visible to the
                     // retry classifier.
                     let error_str = format!("{e:#}").to_lowercase();
-                    if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                    if is_retryable_error(&error_str) && policy.allows_retry_after(attempt) {
                         if saw_output {
                             // Partial output already reached the consumer; tell
                             // it to discard the partial attempt so the retried
                             // response replays cleanly instead of duplicating.
                             jcode_base::logging::warn(&format!(
                                 "Copilot stream failed after partial output (attempt {}/{}); rolling back partial attempt and retrying: {}",
-                                attempt + 1,
-                                MAX_RETRIES,
+                                attempt.saturating_add(1),
+                                max_retries,
                                 e
                             ));
                             let _ = tx
                                 .send(Ok(StreamEvent::RetryRollback {
-                                    attempt: attempt + 2,
-                                    max: MAX_RETRIES,
+                                    attempt: attempt.saturating_add(2),
+                                    max: max_retries,
                                 }))
                                 .await;
                         } else {
                             jcode_base::logging::info(&format!(
                                 "Copilot stream failed (attempt {}/{}), will retry: {}",
-                                attempt + 1,
-                                MAX_RETRIES,
+                                attempt.saturating_add(1),
+                                max_retries,
                                 e
                             ));
                         }
+                        next_retry_delay = policy.retry_after_from_error(&e);
                         last_error = Some(e);
                         continue;
                     }
@@ -638,7 +686,7 @@ impl CopilotApiProvider {
             let _ = tx
                 .send(Err(anyhow::anyhow!(
                     "Copilot: failed after {} retries: {}",
-                    MAX_RETRIES,
+                    max_retries,
                     e
                 )))
                 .await;
@@ -667,6 +715,20 @@ impl CopilotApiProvider {
                     timeout.as_secs()
                 ),
             };
+            if let StreamEvent::Error {
+                message,
+                retry_after_secs,
+            } = &event
+            {
+                return Err(jcode_provider_core::retry_after::error_with_retry_after(
+                    message.clone(),
+                    retry_after_secs.map(|seconds| {
+                        jcode_provider_core::retry_after::RetryAfter::from_delay(
+                            std::time::Duration::from_secs(seconds),
+                        )
+                    }),
+                ));
+            }
             if let StreamEvent::TokenUsage {
                 input_tokens: input,
                 output_tokens: output,
@@ -767,6 +829,10 @@ impl CopilotApiProvider {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
+
+                    if let Some(error) = parsed.get("error") {
+                        anyhow::bail!("Copilot stream error: {error}");
+                    }
 
                     // Extract usage if present
                     if let Some(usage) = parsed.get("usage") {

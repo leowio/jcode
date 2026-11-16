@@ -848,3 +848,212 @@ fn sonnet5_effort_fallback_without_catalog() {
     assert!(provider.set_reasoning_effort("high").is_err());
     assert_eq!(provider.reasoning_effort(), None);
 }
+
+struct RetryConfigGuard(Option<std::ffi::OsString>);
+impl RetryConfigGuard {
+    fn set(value: &str) -> Self {
+        let previous = std::env::var_os("JCODE_MAX_RETRIES");
+        jcode_base::env::set_var("JCODE_MAX_RETRIES", value);
+        jcode_base::config::invalidate_config_cache();
+        Self(previous)
+    }
+}
+impl Drop for RetryConfigGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(value) => jcode_base::env::set_var("JCODE_MAX_RETRIES", value),
+            None => jcode_base::env::remove_var("JCODE_MAX_RETRIES"),
+        }
+        jcode_base::config::invalidate_config_cache();
+    }
+}
+
+fn retry_loopback_case(limit: &str, failures: usize, permanent: bool, cancel: bool) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+    let _guard = jcode_base::storage::lock_test_env();
+    let _limit = RetryConfigGuard::set(limit);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        let mut attempts = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 4096];
+                let n = socket.read(&mut bytes).unwrap();
+                assert_ne!(n, 0);
+                request.extend_from_slice(&bytes[..n]);
+                if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if request.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            attempts += 1;
+            let (status, body) = if attempts <= failures {
+                (
+                    if permanent {
+                        "400 Bad Request"
+                    } else {
+                        "503 Service Unavailable"
+                    },
+                    "{\"error\":{\"message\":\"overloaded\"}}",
+                )
+            } else {
+                (
+                    "200 OK",
+                    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"final\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+                )
+            };
+            let retry_after = if cancel { 600 } else { 0 };
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+        attempts
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let events = runtime.block_on(async {
+        let provider = make_test_provider(vec![]);
+        *provider.bearer_token.write().await = Some(copilot_auth::CopilotApiToken {
+            token: "test-bearer".into(), expires_at: Utc::now().timestamp() + 3600,
+        });
+        let (tx, mut rx) = mpsc::channel(100);
+        let operation = provider.stream_request_at(json!({"model":"fixture","input":[]}), true, true, tx, &base);
+        tokio::pin!(operation);
+        if cancel {
+            tokio::select! {
+                _ = &mut operation => panic!("must remain in retry wait"),
+                _ = async { while let Some(event) = rx.recv().await {
+                    if matches!(event, Ok(StreamEvent::ConnectionPhase {phase: jcode_message_types::ConnectionPhase::Retrying {..}})) {break;}
+                }} => {}
+            }
+            drop(rx);
+            tokio::time::timeout(Duration::from_millis(200), &mut operation).await.expect("cancel must stop retry backoff");
+            vec![]
+        } else {
+            tokio::time::timeout(Duration::from_secs(8), &mut operation).await.unwrap();
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await { events.push(event); }
+            events
+        }
+    });
+    stop.store(true, Ordering::SeqCst);
+    let attempts = server.join().unwrap();
+    if cancel || permanent {
+        assert_eq!(attempts, 1);
+    } else if limit == "2" {
+        assert_eq!(attempts, 2);
+    } else {
+        assert_eq!(attempts, failures + 1);
+    }
+    if !cancel {
+        if permanent || limit == "2" {
+            assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
+        } else {
+            assert!(events.iter().all(Result::is_ok));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(
+                        |event| matches!(event,Ok(StreamEvent::TextDelta(text)) if text == "final")
+                    )
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn unlimited_retry_outlasts_previous_copilot_limit() {
+    retry_loopback_case("4294967295", 9, false, false);
+}
+#[test]
+fn finite_copilot_retry_policy_is_bounded() {
+    retry_loopback_case("2", 9, false, false);
+}
+#[test]
+fn retry_permanent_copilot_failure_stops_in_unlimited_mode() {
+    retry_loopback_case("4294967295", 9, true, false);
+}
+#[test]
+fn retry_unlimited_copilot_backoff_is_cancellable() {
+    retry_loopback_case("4294967295", 9, false, true);
+}
+
+#[test]
+fn deterministic_copilot_errors_win_over_transient_prose() {
+    for message in [
+        "insufficient_quota rate_limit",
+        "http 401 unauthorized server_error",
+        "invalid_request_error timeout",
+    ] {
+        assert!(!is_retryable_error(message));
+    }
+}
+
+#[test]
+fn retry_responses_error_is_not_forwarded_as_success_and_retains_hint() {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        while !request.windows(4).any(|part| part == b"\r\n\r\n") {
+            let mut bytes = [0; 4096];
+            let n = socket.read(&mut bytes).unwrap();
+            assert_ne!(n, 0);
+            request.extend_from_slice(&bytes[..n]);
+        }
+        let body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"rate_limit_error\",\"message\":\"Slow down\",\"retry_after\":7}}}\n\n";
+        write!(socket,"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+    });
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let response = reqwest::Client::new().get(url).send().await.unwrap();
+            let provider = make_test_provider(vec![]);
+            let (tx, mut rx) = mpsc::channel(10);
+            let error = provider
+                .process_responses_sse_stream(response, tx)
+                .await
+                .unwrap_err();
+            assert!(is_retryable_error(&error.to_string().to_ascii_lowercase()));
+            let delay = jcode_provider_core::retry_after::retry_after_from_error(&error).unwrap();
+            assert!(delay > std::time::Duration::from_secs(5));
+            assert!(
+                rx.try_recv().is_err(),
+                "retryable error must not leak a terminal stream event"
+            );
+        });
+    server.join().unwrap();
+}

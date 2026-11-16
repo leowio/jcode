@@ -89,6 +89,7 @@ pub fn classify_failure(message: &str, retry_after: Option<Duration>) -> Failure
 /// Credentials, billing, quota, invalid requests, policy refusals, and
 /// failures the runtime handles itself (context overflow is auto-compacted).
 const PERMANENT_MARKERS: &[&str] = &[
+    "unsafe_to_replay",
     // Credentials.
     "unauthorized",
     "status 401",
@@ -100,7 +101,6 @@ const PERMANENT_MARKERS: &[&str] = &[
     "invalid x-api-key",
     "incorrect api key",
     "api key not valid",
-    "token refresh failed",
     "refresh_token_invalidated",
     "invalid_grant",
     "token expired",
@@ -214,10 +214,12 @@ const TRANSIENT_MARKERS: &[&str] = &[
     "stream error",
     "stream closed",
     "stream stalled",
+    "stream disconnected before completion",
     "no data received",
     // Timeouts.
     "timed out",
     "timeout",
+    "did not complete within",
     // Provider side.
     "500 internal server error",
     "internal server error",
@@ -297,7 +299,8 @@ const CLOSE_GRACE: Duration = Duration::from_secs(10);
 /// Tuning for [`TurnRetry`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetryPolicy {
-    /// Automatic retries per user request. Zero disables retrying.
+    /// Automatic retries per user request. Zero disables retrying;
+    /// `u32::MAX` retries transient failures until cancellation.
     pub max_attempts: u32,
     /// Delay before the first retry. Later retries double it.
     pub base_delay: Duration,
@@ -316,12 +319,25 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
+    /// Retry transient failures until the user cancels or sends new input.
+    pub fn unlimited() -> Self {
+        Self {
+            max_attempts: u32::MAX,
+            ..Self::default()
+        }
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.max_attempts == u32::MAX
+    }
+
     fn delay(&self, attempt: u32, kind: FailureKind) -> Option<Duration> {
         if let FailureKind::RateLimited {
             retry_after: Some(wait),
         } = kind
         {
-            return (wait <= MAX_RATE_LIMIT_WAIT).then_some(wait.max(self.base_delay));
+            return (self.is_unlimited() || wait <= MAX_RATE_LIMIT_WAIT)
+                .then_some(wait.max(self.base_delay));
         }
         let factor = 1u32 << attempt.saturating_sub(1).min(16);
         Some(self.base_delay.saturating_mul(factor).min(self.max_delay))
@@ -411,7 +427,11 @@ impl TurnRetry {
     pub fn take_due(&mut self, now: Instant) -> bool {
         match self.due {
             // Never hold a retry forever on a close event that was lost.
-            Some(at) if now >= at && (!self.awaiting_close || now >= at + CLOSE_GRACE) => {
+            Some(at)
+                if now >= at
+                    && (!self.awaiting_close
+                        || now.saturating_duration_since(at) >= CLOSE_GRACE) =>
+            {
                 self.due = None;
                 self.stop = None;
                 self.awaiting_close = false;
@@ -424,7 +444,9 @@ impl TurnRetry {
     /// The retry could not be sent (for example the connection is down).
     /// Reschedule it rather than losing it.
     pub fn send_failed(&mut self, now: Instant) {
-        self.due = Some(now + self.policy.base_delay);
+        if !self.suppressed {
+            self.due = now.checked_add(self.policy.base_delay);
+        }
     }
 
     /// Observe one event from the session's stream.
@@ -513,7 +535,7 @@ impl TurnRetry {
                 exhausted: false,
             };
         }
-        if self.attempts >= self.policy.max_attempts {
+        if !self.policy.is_unlimited() && self.attempts >= self.policy.max_attempts {
             self.due = None;
             self.awaiting_close = false;
             return RetryDecision::GaveUp {
@@ -521,7 +543,8 @@ impl TurnRetry {
                 exhausted: true,
             };
         }
-        let Some(delay) = self.policy.delay(self.attempts + 1, kind) else {
+        let next_attempt = self.attempts.saturating_add(1);
+        let Some(delay) = self.policy.delay(next_attempt, kind) else {
             self.due = None;
             self.awaiting_close = false;
             return RetryDecision::GaveUp {
@@ -529,8 +552,15 @@ impl TurnRetry {
                 exhausted: false,
             };
         };
-        self.attempts += 1;
-        let at = now + delay;
+        let Some(at) = now.checked_add(delay) else {
+            self.due = None;
+            self.awaiting_close = false;
+            return RetryDecision::GaveUp {
+                attempts: self.attempts,
+                exhausted: false,
+            };
+        };
+        self.attempts = next_attempt;
         self.due = Some(at);
         self.awaiting_close = stop.is_some();
         RetryDecision::Scheduled {
@@ -548,6 +578,33 @@ impl TurnRetry {
         } else {
             RetryDecision::None
         }
+    }
+}
+
+#[cfg(test)]
+mod unlimited_counter_tests {
+    use super::*;
+
+    #[test]
+    fn unlimited_counter_saturates_without_exhausting() {
+        let now = Instant::now();
+        let mut retry = TurnRetry::new(RetryPolicy::unlimited());
+        retry.attempts = u32::MAX;
+        let decision = retry.observe(
+            &ApiEvent::Error {
+                code: ErrorCode::Internal,
+                message: "HTTP 503 Service Unavailable".into(),
+            },
+            now,
+        );
+        assert!(matches!(
+            decision,
+            RetryDecision::Scheduled {
+                attempt: u32::MAX,
+                ..
+            }
+        ));
+        assert_eq!(retry.attempts(), u32::MAX);
     }
 }
 

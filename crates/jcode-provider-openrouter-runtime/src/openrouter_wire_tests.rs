@@ -96,6 +96,7 @@ fn captured_request_for_host(host: &str, conversation_id: &str) -> String {
     rt.block_on(async {
         let (addr, rx) = spawn_header_capturing_server();
         let client = reqwest::Client::builder()
+            .no_proxy()
             .resolve(host, addr)
             .build()
             .expect("client");

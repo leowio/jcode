@@ -36,43 +36,56 @@ pub(super) fn should_retry_recoverable_rate_limit(
         && retry_after.is_none_or(|delay| delay <= std::time::Duration::from_secs(5))
 }
 
-/// Check if an error is transient and should be retried
+/// Deterministic failures take precedence over incidental transient wording.
 pub(super) fn is_retryable_error(error_str: &str) -> bool {
+    if jcode_provider_core::failover::is_definitive_usage_exhaustion(error_str)
+        || [
+            "400 bad request",
+            "401 unauthorized",
+            "403 forbidden",
+            "404 not found",
+            "413 payload too large",
+            "422 unprocessable",
+            "invalid_request_error",
+            "authentication_error",
+            "permission_error",
+            "not_found_error",
+            "invalid_api_key",
+            "invalid api key",
+            "invalid_grant",
+            "context length",
+            "context window",
+            "prompt is too long",
+            "content_policy_violation",
+            "cancelled",
+            "canceled",
+        ]
+        .iter()
+        .any(|marker| error_str.contains(marker))
+    {
+        return false;
+    }
     jcode_provider_core::is_transient_transport_error(error_str)
-        // Server errors (5xx)
         || error_str.contains("500 internal server error")
         || error_str.contains("502 bad gateway")
         || error_str.contains("503 service unavailable")
         || error_str.contains("504 gateway timeout")
         || error_str.contains("overloaded")
-        // Rate limiting (429)
         || error_str.contains("429 too many requests")
         || error_str.contains("rate limit")
         || error_str.contains("rate_limit")
-        // API-level server errors (SSE error events)
         || error_str.contains("api_error")
         || error_str.contains("internal server error")
 }
 
-/// Whether the retry loop should run another attempt after `attempt` (0-based)
-/// failed with `error_str` (lowercased).
-///
-/// Every transient error gets [`MAX_RETRIES`] attempts. Pure transport faults
-/// get up to [`TRANSPORT_MAX_RETRIES`], provided the first failure was less
-/// than [`TRANSPORT_RETRY_WINDOW`] ago, so a brief network blip (Wi-Fi roam,
-/// DHCP renewal) is outlasted without letting slow timeouts stall the turn.
+/// The shared configured budget owns both transport and provider retries.
+/// An unlimited budget must not be shortened by a separate transport window.
 pub(super) fn should_retry_transient(
     error_str: &str,
     attempt: u32,
-    since_first_failure: std::time::Duration,
+    policy: &jcode_provider_core::retry_policy::RetryPolicy,
 ) -> bool {
-    if !is_retryable_error(error_str) {
-        return false;
-    }
-    attempt + 1 < MAX_RETRIES
-        || (jcode_provider_core::is_transient_transport_error(error_str)
-            && attempt + 1 < TRANSPORT_MAX_RETRIES
-            && since_first_failure < TRANSPORT_RETRY_WINDOW)
+    is_retryable_error(error_str) && policy.allows_retry_after(attempt)
 }
 
 pub(super) fn is_fable_scoped_limit_error(model: &str, error: &str) -> bool {
@@ -297,73 +310,47 @@ pub(super) fn is_oauth_catalog_auth_error(error_str: &str) -> bool {
 #[cfg(test)]
 mod transport_retry_tests {
     use super::*;
+    use jcode_provider_core::retry_policy::RetryPolicy;
     use std::time::Duration;
 
-    /// The exact failure a Wi-Fi roam produced in the wild (lowercased chain).
     const ROAM_ERROR: &str = "failed to send request to anthropic api: error sending request for url \
         (https://api.anthropic.com/v1/messages?beta=true): client error (sendrequest): http2 error: \
         stream error received: unspecific protocol error detected";
 
     #[test]
-    fn transport_faults_outlast_the_default_budget() {
-        for attempt in 0..TRANSPORT_MAX_RETRIES - 1 {
-            assert!(
-                should_retry_transient(ROAM_ERROR, attempt, Duration::from_secs(10)),
-                "attempt {attempt} should retry"
-            );
+    fn configured_finite_budget_bounds_transport_and_server_errors() {
+        let policy = RetryPolicy::new(6, Duration::from_secs(30));
+        for error in [ROAM_ERROR, "529 overloaded"] {
+            for attempt in 0..5 {
+                assert!(should_retry_transient(error, attempt, &policy));
+            }
+            assert!(!should_retry_transient(error, 5, &policy));
         }
-        assert!(!should_retry_transient(
-            ROAM_ERROR,
-            TRANSPORT_MAX_RETRIES - 1,
-            Duration::from_secs(10)
-        ));
     }
 
     #[test]
-    fn backoff_covers_a_network_blip() {
-        // Lower jitter bound (0.8x) of 1s, 2s, 4s, 8s, 16s.
-        let minimum_wait_ms: u64 = (1..TRANSPORT_MAX_RETRIES)
-            .map(|attempt| RETRY_BASE_DELAY_MS * (1 << (attempt - 1)) * 8 / 10)
-            .sum();
-        assert!(minimum_wait_ms >= 20_000, "only waits {minimum_wait_ms}ms");
+    fn unlimited_budget_outlasts_legacy_caps_without_counter_overflow() {
+        let policy = RetryPolicy::new(u32::MAX, Duration::from_secs(30));
+        for error in [ROAM_ERROR, "529 overloaded", "429 too many requests"] {
+            for attempt in [0, 2, 5, 8, 100, u32::MAX - 1, u32::MAX] {
+                assert!(should_retry_transient(error, attempt, &policy));
+            }
+        }
     }
 
     #[test]
-    fn extended_transport_retries_stop_after_the_window() {
-        assert!(!should_retry_transient(
-            ROAM_ERROR,
-            MAX_RETRIES - 1,
-            TRANSPORT_RETRY_WINDOW
-        ));
-        // The default budget is never shortened by the window.
-        assert!(should_retry_transient(
-            ROAM_ERROR,
-            0,
-            TRANSPORT_RETRY_WINDOW
-        ));
-    }
-
-    #[test]
-    fn server_errors_keep_the_default_budget() {
-        let overloaded = "529 overloaded";
-        assert!(should_retry_transient(
-            overloaded,
-            MAX_RETRIES - 2,
-            Duration::ZERO
-        ));
-        assert!(!should_retry_transient(
-            overloaded,
-            MAX_RETRIES - 1,
-            Duration::ZERO
-        ));
-    }
-
-    #[test]
-    fn deterministic_errors_never_retry() {
-        assert!(!should_retry_transient(
+    fn deterministic_errors_win_over_transient_words() {
+        let policy = RetryPolicy::new(u32::MAX, Duration::from_secs(30));
+        for error in [
             "401 unauthorized",
-            0,
-            Duration::ZERO
-        ));
+            "401 unauthorized: rate limit",
+            "invalid_request_error: overloaded",
+            "insufficient_quota: rate_limit_error",
+            "usage exhausted: 429 too many requests",
+            "context length exceeded: api_error",
+            "cancelled: connection reset",
+        ] {
+            assert!(!should_retry_transient(error, 0, &policy), "{error}");
+        }
     }
 }

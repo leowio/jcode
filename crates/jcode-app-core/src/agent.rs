@@ -13,6 +13,7 @@ mod messages;
 mod model_usage_tests;
 mod prompting;
 mod provider;
+mod provider_retry;
 mod response_recovery;
 mod runtime_recovery;
 mod status;

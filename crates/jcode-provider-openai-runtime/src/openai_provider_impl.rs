@@ -325,11 +325,21 @@ impl Provider for OpenAIProvider {
         let model_for_transport = model_id.clone();
         let client = self.client.clone();
         let panic_tx = tx.clone();
+        let config = jcode_base::config::config();
+        let retry_policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+            config.provider.max_retries,
+            Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1)),
+        );
 
         tokio::spawn(async move {
             let stream_task = async move {
                 let mut retry_diagnostics =
                     super::openai_retry_diagnostics::OpenAIRetryDiagnostics::default();
+                let mut last_error = None;
+                let mut force_https_for_request = false;
+                let mut skip_backoff_once = false;
+                let mut next_retry_delay = None;
+                let mut first_attempt = 0;
                 // Attempt persistent WebSocket continuation first
                 if use_websocket_transport {
                     // Track output: a continuation that streams partial output
@@ -357,14 +367,40 @@ impl Provider for OpenAIProvider {
 
                     match continuation_result {
                         PersistentWsResult::OpaqueWsRejection => {
-                            recover_opaque_ws_rejection(
+                            let (recovery_tx, recovery_guard) =
+                                jcode_provider_core::attempt_tracker::track_attempt_output(
+                                    tx.clone(),
+                                );
+                            let recovery = recover_opaque_ws_rejection(
                                 Arc::clone(&credentials),
                                 account_label.clone(),
                                 request.clone(),
-                                &tx,
+                                &recovery_tx,
                             )
                             .await;
-                            return;
+                            drop(recovery_tx);
+                            let recovery_output = recovery_guard.finish().await;
+                            match recovery {
+                                Ok(()) => return,
+                                Err(error) if retry_policy.allows_retry_after(0) => {
+                                    if recovery_output {
+                                        let _ = tx
+                                            .send(Ok(StreamEvent::RetryRollback {
+                                                attempt: 2,
+                                                max: retry_policy.max_attempts(),
+                                            }))
+                                            .await;
+                                    }
+                                    next_retry_delay = retry_policy.retry_after_from_error(&error);
+                                    last_error = Some(error);
+                                    force_https_for_request = true;
+                                    first_attempt = 1;
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Err(error)).await;
+                                    return;
+                                }
+                            }
                         }
                         PersistentWsResult::TerminalError => return,
                         PersistentWsResult::Success => {
@@ -404,7 +440,7 @@ impl Provider for OpenAIProvider {
                                 vec![
                                     ("model", model_for_transport.clone()),
                                     ("transport", "websocket".to_string()),
-                                    ("error", err.clone()),
+                                    ("error", format!("{err:#}")),
                                 ],
                             );
                             jcode_base::logging::warn(&format!(
@@ -419,24 +455,24 @@ impl Provider for OpenAIProvider {
                                 let _ = tx
                                     .send(Ok(StreamEvent::RetryRollback {
                                         attempt: 1,
-                                        max: MAX_RETRIES,
+                                        max: retry_policy.max_attempts(),
                                     }))
                                     .await;
                             }
-                            if let Some(notice) = retry_diagnostics.record(&err) {
+                            if let Some(notice) = retry_diagnostics.record(&format!("{err:#}")) {
                                 emit_status_detail(&tx, notice).await;
+                            }
+                            if let Some(delay) = retry_policy.retry_after_from_error(&err) {
+                                next_retry_delay = Some(delay);
+                                first_attempt = 1;
+                                last_error = Some(err);
                             }
                         }
                     }
                 }
 
                 // Normal path: fresh connection with full input (with retry logic)
-                let mut last_error = None;
-                let mut force_https_for_request = false;
-                let mut skip_backoff_once = false;
-                let mut next_retry_delay = None;
-
-                for attempt in 0..MAX_RETRIES {
+                for attempt in retry_policy.attempts().skip(first_attempt) {
                     if tx.is_closed() {
                         return;
                     }
@@ -444,17 +480,17 @@ impl Provider for OpenAIProvider {
                         emit_connection_phase(
                             &tx,
                             jcode_message_types::ConnectionPhase::Retrying {
-                                attempt: attempt + 1,
-                                max: MAX_RETRIES,
+                                attempt: attempt.saturating_add(1),
+                                max: retry_policy.max_attempts(),
                             },
                         )
                         .await;
                     }
                     if attempt > 0 && !skip_backoff_once {
-                        let delay = jcode_provider_core::retry_after::retry_delay(
+                        let delay = retry_policy.delay(
                             attempt,
-                            RETRY_BASE_DELAY_MS,
                             next_retry_delay.take(),
+                            RETRY_BASE_DELAY_MS,
                         );
                         if while_consumer_open(&tx, tokio::time::sleep(delay))
                             .await
@@ -464,8 +500,8 @@ impl Provider for OpenAIProvider {
                         }
                         jcode_base::logging::info(&format!(
                             "Retrying OpenAI API request (attempt {}/{})",
-                            attempt + 1,
-                            MAX_RETRIES
+                            attempt.saturating_add(1),
+                            retry_policy.max_attempts()
                         ));
                     }
                     skip_backoff_once = false;
@@ -513,8 +549,8 @@ impl Provider for OpenAIProvider {
                         "attempt_start",
                         vec![
                             ("model", model_for_transport.clone()),
-                            ("attempt", (attempt + 1).to_string()),
-                            ("max_attempts", MAX_RETRIES.to_string()),
+                            ("attempt", (attempt.saturating_add(1)).to_string()),
+                            ("max_attempts", retry_policy.max_attempts().to_string()),
                             ("transport", transport_label.to_string()),
                             ("transport_mode", transport_mode.as_str().to_string()),
                             ("forced_https", force_https_for_request.to_string()),
@@ -522,8 +558,8 @@ impl Provider for OpenAIProvider {
                     );
                     jcode_base::logging::info(&format!(
                         "OpenAI stream attempt {}/{} using transport '{}'; model='{}'; mode='{}'",
-                        attempt + 1,
-                        MAX_RETRIES,
+                        attempt.saturating_add(1),
+                        retry_policy.max_attempts(),
                         transport_label,
                         model_for_transport,
                         transport_mode.as_str()
@@ -594,14 +630,40 @@ impl Provider for OpenAIProvider {
 
                     match result {
                         Err(OpenAIStreamFailure::OpaqueWsRejection) => {
-                            recover_opaque_ws_rejection(
+                            let (recovery_tx, recovery_guard) =
+                                jcode_provider_core::attempt_tracker::track_attempt_output(
+                                    tx.clone(),
+                                );
+                            let recovery = recover_opaque_ws_rejection(
                                 Arc::clone(&credentials),
                                 account_label.clone(),
                                 request.clone(),
-                                &tx,
+                                &recovery_tx,
                             )
                             .await;
-                            return;
+                            drop(recovery_tx);
+                            let recovery_output = recovery_guard.finish().await;
+                            match recovery {
+                                Ok(()) => return,
+                                Err(error) if retry_policy.allows_retry_after(attempt) => {
+                                    if recovery_output {
+                                        let _ = tx
+                                            .send(Ok(StreamEvent::RetryRollback {
+                                                attempt: attempt.saturating_add(2),
+                                                max: retry_policy.max_attempts(),
+                                            }))
+                                            .await;
+                                    }
+                                    next_retry_delay = retry_policy.retry_after_from_error(&error);
+                                    last_error = Some(error);
+                                    force_https_for_request = true;
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let _ = tx.send(Err(error)).await;
+                                    return;
+                                }
+                            }
                         }
                         Ok(()) => {
                             log_openai_stream_lifecycle(
@@ -609,7 +671,7 @@ impl Provider for OpenAIProvider {
                                 "attempt_success",
                                 vec![
                                     ("model", model_for_transport.clone()),
-                                    ("attempt", (attempt + 1).to_string()),
+                                    ("attempt", (attempt.saturating_add(1)).to_string()),
                                     ("transport", transport_label.to_string()),
                                     (
                                         "elapsed_ms",
@@ -637,7 +699,7 @@ impl Provider for OpenAIProvider {
                                 "fallback_to_https",
                                 vec![
                                     ("model", model_for_transport.clone()),
-                                    ("attempt", (attempt + 1).to_string()),
+                                    ("attempt", (attempt.saturating_add(1)).to_string()),
                                     ("transport", transport_label.to_string()),
                                     ("reason", reason.to_string()),
                                     ("fallback_reason", fallback_reason.summary().to_string()),
@@ -656,8 +718,8 @@ impl Provider for OpenAIProvider {
                                 // duplicating.
                                 let _ = tx
                                     .send(Ok(StreamEvent::RetryRollback {
-                                        attempt: attempt + 2,
-                                        max: MAX_RETRIES,
+                                        attempt: attempt.saturating_add(2),
+                                        max: retry_policy.max_attempts(),
                                     }))
                                     .await;
                             }
@@ -697,7 +759,9 @@ impl Provider for OpenAIProvider {
                             // request to OpenAI API")` (e.g. TLS BadRecordMac) is
                             // visible to the retry classifier.
                             let error_str = format!("{error:#}").to_lowercase();
-                            if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                            if is_retryable_error(&error_str)
+                                && retry_policy.allows_retry_after(attempt)
+                            {
                                 if saw_output {
                                     // Partial output already reached the
                                     // consumer; roll it back so the retried
@@ -705,8 +769,8 @@ impl Provider for OpenAIProvider {
                                     // duplicating.
                                     let _ = tx
                                         .send(Ok(StreamEvent::RetryRollback {
-                                            attempt: attempt + 2,
-                                            max: MAX_RETRIES,
+                                            attempt: attempt.saturating_add(2),
+                                            max: retry_policy.max_attempts(),
                                         }))
                                         .await;
                                 }
@@ -715,8 +779,8 @@ impl Provider for OpenAIProvider {
                                     "retry_scheduled",
                                     vec![
                                         ("model", model_for_transport.clone()),
-                                        ("attempt", (attempt + 1).to_string()),
-                                        ("next_attempt", (attempt + 2).to_string()),
+                                        ("attempt", (attempt.saturating_add(1)).to_string()),
+                                        ("next_attempt", (attempt.saturating_add(2)).to_string()),
                                         ("transport", transport_label.to_string()),
                                         ("error", error.to_string()),
                                         ("elapsed_ms", elapsed_ms.to_string()),
@@ -731,10 +795,7 @@ impl Provider for OpenAIProvider {
                                     "Transient error after {}ms, will retry: {}",
                                     elapsed_ms, error
                                 ));
-                                next_retry_delay =
-                                    jcode_provider_core::retry_after::retry_after_from_error(
-                                        &error,
-                                    );
+                                next_retry_delay = retry_policy.retry_after_from_error(&error);
                                 last_error = Some(error);
                                 continue;
                             }
@@ -743,7 +804,7 @@ impl Provider for OpenAIProvider {
                                 "attempt_failed",
                                 vec![
                                     ("model", model_for_transport.clone()),
-                                    ("attempt", (attempt + 1).to_string()),
+                                    ("attempt", (attempt.saturating_add(1)).to_string()),
                                     ("transport", transport_label.to_string()),
                                     ("will_retry", "false".to_string()),
                                     ("error", error.to_string()),
@@ -787,14 +848,14 @@ impl Provider for OpenAIProvider {
                         "retries_exhausted",
                         vec![
                             ("model", model_for_transport.clone()),
-                            ("max_attempts", MAX_RETRIES.to_string()),
+                            ("max_attempts", retry_policy.max_attempts().to_string()),
                             ("error", e.to_string()),
                         ],
                     );
                     let _ = tx
                         .send(Err(retry_diagnostics.annotate(anyhow::anyhow!(
                             "Failed after {} retries: {}",
-                            MAX_RETRIES,
+                            retry_policy.max_attempts(),
                             e
                         ))))
                         .await;

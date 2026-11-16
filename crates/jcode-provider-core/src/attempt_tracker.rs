@@ -28,7 +28,7 @@ use tokio::task::JoinHandle;
 /// Status-style events (connection phases, token usage snapshots, transport
 /// labels) are excluded: consumers overwrite rather than accumulate them, so a
 /// replay is harmless.
-fn stream_event_is_replay_visible(event: &StreamEvent) -> bool {
+pub fn stream_event_is_replay_visible(event: &StreamEvent) -> bool {
     match event {
         StreamEvent::TextDelta(_)
         | StreamEvent::TextSuffixReplace { .. }

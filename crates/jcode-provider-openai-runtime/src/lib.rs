@@ -68,7 +68,8 @@ use model_capabilities::{
 };
 mod model_capabilities;
 
-/// Maximum number of retries for transient errors
+/// Fixed attempt budget used by bounded regression fixtures.
+#[cfg(test)]
 const MAX_RETRIES: u32 = 3;
 
 /// Base delay for exponential backoff (in milliseconds)

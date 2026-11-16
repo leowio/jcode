@@ -26,7 +26,7 @@ impl Server {
         let thread = std::thread::spawn(move || {
             let mut requests = Vec::new();
             let deadline = Instant::now() + Duration::from_secs(12);
-            while !thread_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            'accept: while !thread_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
                 let (mut socket, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -46,10 +46,14 @@ impl Server {
                     bytes.extend_from_slice(&buffer[..count]);
                     if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
                         let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                        if headers.starts_with("get ") {
+                            socket.write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                            continue 'accept;
+                        }
                         let length: usize = headers
                             .lines()
                             .find_map(|line| line.strip_prefix("content-length: "))
-                            .unwrap()
+                            .unwrap_or_else(|| panic!("missing body length: {headers}"))
                             .parse()
                             .unwrap();
                         if bytes.len() >= end + 4 + length {
@@ -99,31 +103,31 @@ fn run_azure(base: String) -> Vec<Result<StreamEvent>> {
         .unwrap();
     runtime.block_on(async {
         let (tx, mut rx) = mpsc::channel(64);
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            run_stream_with_retries(
-                reqwest::Client::new(),
-                base,
-                ProviderAuth::None {
-                    label: "test".into(),
-                },
-                false,
-                "azure-retry-test".into(),
-                serde_json::json!({"model":"deployment", "input":[], "stream":true}),
-                true,
-                tx,
-                Arc::new(Mutex::new(None)),
-                "deployment".into(),
-                false,
-            ),
-        )
+        let task = tokio::spawn(run_stream_with_retries(
+            reqwest::Client::new(),
+            base,
+            ProviderAuth::None {
+                label: "test".into(),
+            },
+            false,
+            "azure-retry-test".into(),
+            serde_json::json!({"model":"deployment", "input":[], "stream":true}),
+            true,
+            tx,
+            Arc::new(Mutex::new(None)),
+            "deployment".into(),
+            false,
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut events = Vec::new();
+            while let Some(event) = rx.recv().await {
+                events.push(event);
+            }
+            task.await.unwrap();
+            events
+        })
         .await
-        .expect("retry loop must finish");
-        let mut events = Vec::new();
-        while let Some(event) = rx.recv().await {
-            events.push(event);
-        }
-        events
+        .expect("retry loop must finish")
     })
 }
 
@@ -223,4 +227,54 @@ fn azure_unknown_failure_does_not_inherit_stream_error_retry_heuristic() {
         jcode_provider_core::retry_after::retry_after_from_error(&error).unwrap()
             <= jcode_provider_core::retry_after::MAX_RETRY_AFTER
     );
+}
+
+struct RetryConfigGuard(Option<std::ffi::OsString>);
+impl RetryConfigGuard {
+    fn set(value: &str) -> Self {
+        let guard = Self(std::env::var_os("JCODE_MAX_RETRIES"));
+        jcode_base::env::set_var("JCODE_MAX_RETRIES", value);
+        jcode_base::config::invalidate_config_cache();
+        guard
+    }
+}
+impl Drop for RetryConfigGuard {
+    fn drop(&mut self) {
+        match &self.0 {
+            Some(value) => jcode_base::env::set_var("JCODE_MAX_RETRIES", value),
+            None => jcode_base::env::remove_var("JCODE_MAX_RETRIES"),
+        }
+        jcode_base::config::invalidate_config_cache();
+    }
+}
+
+#[test]
+fn azure_unlimited_retries_outlast_previous_limits() {
+    let _lock = jcode_base::storage::lock_test_env();
+    let _retry = RetryConfigGuard::set("4294967295");
+    let body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"Temporary overload\",\"retry_after\":0}}}\n\n";
+    let mut bodies = vec![body.into(); 9];
+    bodies.push(COMPLETE.into());
+    let server = Server::new(bodies);
+    let events = run_azure(server.base.clone());
+    assert_eq!(server.finish().len(), 10);
+    assert!(events.iter().all(Result::is_ok));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Ok(StreamEvent::TextDelta(text)) if text == "final"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn azure_finite_retry_budget_remains_bounded() {
+    let _lock = jcode_base::storage::lock_test_env();
+    let _retry = RetryConfigGuard::set("2");
+    let body = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"type\":\"server_error\",\"message\":\"Temporary overload\",\"retry_after\":0}}}\n\n";
+    let server = Server::new(vec![body.into(); 9]);
+    let events = run_azure(server.base.clone());
+    assert_eq!(server.finish().len(), 2);
+    assert_eq!(events.iter().filter(|event| event.is_err()).count(), 1);
 }

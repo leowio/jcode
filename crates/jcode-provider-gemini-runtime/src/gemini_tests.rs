@@ -10,18 +10,21 @@ impl EnvVarGuard {
     pub(super) fn set_path(key: &'static str, value: &std::path::Path) -> Self {
         let previous = std::env::var_os(key);
         jcode_base::env::set_var(key, value);
+        jcode_base::config::invalidate_config_cache();
         Self { key, previous }
     }
 
     pub(super) fn set_value(key: &'static str, value: &str) -> Self {
         let previous = std::env::var_os(key);
         jcode_base::env::set_var(key, value);
+        jcode_base::config::invalidate_config_cache();
         Self { key, previous }
     }
 
     pub(super) fn unset(key: &'static str) -> Self {
         let previous = std::env::var_os(key);
         jcode_base::env::remove_var(key);
+        jcode_base::config::invalidate_config_cache();
         Self { key, previous }
     }
 }
@@ -33,6 +36,7 @@ impl Drop for EnvVarGuard {
         } else {
             jcode_base::env::remove_var(self.key);
         }
+        jcode_base::config::invalidate_config_cache();
     }
 }
 
@@ -829,6 +833,10 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
     use reqwest::StatusCode;
     assert_eq!(
         gemini_http_retry_delay(
+            jcode_provider_core::retry_policy::RetryPolicy::new(
+                MAX_HTTP_RETRIES + 1,
+                Duration::from_secs(30)
+            ),
             "generateContent",
             StatusCode::TOO_MANY_REQUESTS,
             "quota will reset after 0s",
@@ -839,6 +847,10 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
     );
     assert!(
         gemini_http_retry_delay(
+            jcode_provider_core::retry_policy::RetryPolicy::new(
+                MAX_HTTP_RETRIES + 1,
+                Duration::from_secs(30)
+            ),
             "generateContent",
             StatusCode::SERVICE_UNAVAILABLE,
             "No capacity available",
@@ -850,6 +862,10 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
     for code in [400, 401, 403, 404, 501, 505] {
         assert!(
             gemini_http_retry_delay(
+                jcode_provider_core::retry_policy::RetryPolicy::new(
+                    MAX_HTTP_RETRIES + 1,
+                    Duration::from_secs(30)
+                ),
                 "generateContent",
                 StatusCode::from_u16(code).unwrap(),
                 "",
@@ -862,6 +878,10 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
     for code in [429, 500, 502, 503, 504] {
         assert!(
             gemini_http_retry_delay(
+                jcode_provider_core::retry_policy::RetryPolicy::new(
+                    MAX_HTTP_RETRIES + 1,
+                    Duration::from_secs(30)
+                ),
                 "generateContent",
                 StatusCode::from_u16(code).unwrap(),
                 "temporary failure",
@@ -885,6 +905,10 @@ fn http_retry_policy_does_not_replay_onboarding_or_persistent_quota_errors() {
     ] {
         assert!(
             gemini_http_retry_delay(
+                jcode_provider_core::retry_policy::RetryPolicy::new(
+                    MAX_HTTP_RETRIES + 1,
+                    Duration::from_secs(30)
+                ),
                 "generateContent",
                 StatusCode::TOO_MANY_REQUESTS,
                 body,
@@ -897,6 +921,10 @@ fn http_retry_policy_does_not_replay_onboarding_or_persistent_quota_errors() {
     }
     assert!(
         gemini_http_retry_delay(
+            jcode_provider_core::retry_policy::RetryPolicy::new(
+                MAX_HTTP_RETRIES + 1,
+                Duration::from_secs(30)
+            ),
             "onboardUser",
             StatusCode::SERVICE_UNAVAILABLE,
             "backend unavailable",
@@ -1050,4 +1078,165 @@ fn ensure_state_replaces_oauth_cache_when_switching_to_api_key() {
             state.session_id
         );
     });
+}
+
+fn generation_retry_loopback_case(limit: u32, failures: usize, permanent: bool, cancel: bool) {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+    let _lock = jcode_base::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", home.path());
+    let _limit = EnvVarGuard::unset("JCODE_MAX_RETRIES");
+    let mut cfg = jcode_base::config::Config::default();
+    cfg.provider.max_retries = limit;
+    cfg.save().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!("http://{}/generateContent", listener.local_addr().unwrap());
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+    let server = std::thread::spawn(move || {
+        let mut first_tx = Some(first_tx);
+        let mut attempts = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            let (mut socket, _) = match listener.accept() {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(2));
+                    continue;
+                }
+                Err(error) => panic!("{error}"),
+            };
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                let mut buf = [0; 4096];
+                let n = socket.read(&mut buf).unwrap();
+                assert_ne!(n, 0);
+                bytes.extend_from_slice(&buf[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length: usize = headers
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length: "))
+                        .unwrap()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            attempts += 1;
+            let (status, body) = if attempts <= failures {
+                (
+                    if permanent {
+                        "400 Bad Request"
+                    } else {
+                        "503 Service Unavailable"
+                    },
+                    "{\"error\":\"temporary overload\"}",
+                )
+            } else {
+                ("200 OK", "{\"ok\":true}")
+            };
+            let delay = if cancel { 600 } else { 0 };
+            write!(socket,"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {delay}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+            if let Some(tx) = first_tx.take() {
+                let _ = tx.send(());
+            }
+        }
+        attempts
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = runtime.block_on(async {
+        let mut provider = GeminiProvider::new();
+        let (tx, rx) = mpsc::channel(10);
+        if cancel {
+            provider.consumer = Some(tx);
+        }
+        let body = json!({"contents":[]});
+        let request =
+            provider.post_json_api_key::<Value>(&url, "synthetic-key", &body, "generateContent");
+        tokio::pin!(request);
+        if cancel {
+            tokio::select! {
+                result=&mut request=>panic!("request ended early: {result:?}"),
+                _=first_rx=>{}
+            }
+            drop(rx);
+            tokio::time::timeout(Duration::from_millis(200), &mut request)
+                .await
+                .expect("cancellation must interrupt retry wait")
+        } else {
+            tokio::time::timeout(Duration::from_secs(8), &mut request)
+                .await
+                .unwrap()
+        }
+    });
+    stop.store(true, Ordering::SeqCst);
+    let attempts = server.join().unwrap();
+    if cancel || permanent {
+        assert_eq!(attempts, 1);
+        assert!(result.is_err());
+    } else if limit == 2 {
+        assert_eq!(attempts, 2);
+        assert!(result.is_err());
+    } else {
+        assert_eq!(attempts, failures + 1);
+        assert_eq!(result.unwrap(), json!({"ok":true}));
+    }
+}
+
+#[test]
+fn unlimited_generation_retry_outlasts_old_gemini_limit() {
+    generation_retry_loopback_case(u32::MAX, 9, false, false);
+}
+#[test]
+fn finite_generation_retry_stops_at_configured_limit() {
+    generation_retry_loopback_case(2, 9, false, false);
+}
+#[test]
+fn retry_permanent_generation_failure_stops_in_unlimited_mode() {
+    generation_retry_loopback_case(u32::MAX, 9, true, false);
+}
+#[test]
+fn retry_unlimited_generation_backoff_is_cancellable() {
+    generation_retry_loopback_case(u32::MAX, 9, false, true);
+}
+
+#[test]
+fn retry_unlimited_http_policy_keeps_retrying_at_saturated_counter() {
+    let policy =
+        jcode_provider_core::retry_policy::RetryPolicy::new(u32::MAX, Duration::from_secs(30));
+    assert_eq!(
+        gemini_http_retry_delay(
+            policy,
+            "generateContent",
+            reqwest::StatusCode::SERVICE_UNAVAILABLE,
+            "temporary",
+            u32::MAX,
+            Some(Duration::from_secs(60))
+        ),
+        Some(Duration::from_secs(60))
+    );
+    assert!(
+        gemini_http_retry_delay(
+            policy,
+            "generateContent",
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "daily quota exhausted",
+            u32::MAX,
+            None
+        )
+        .is_none()
+    );
 }

@@ -579,6 +579,8 @@ cross_provider_failover = "countdown"
 # stream_idle_timeout_secs = 600
 # Maximum attempts for transient 429/5xx/network failures, including the first
 # request. Retries honor Retry-After and use capped exponential backoff.
+# Set max_retries = 4294967295 for unlimited retries until success or cancellation.
+# Authentication, billing/quota, and invalid-request errors still stop immediately.
 # Env overrides: JCODE_MAX_RETRIES, JCODE_RETRY_BACKOFF_CAP_SECS.
 # max_retries = 8
 # retry_backoff_cap_secs = 30

@@ -355,8 +355,19 @@ async fn persistent_cancellation_public_drop_releases_chain_and_reconnects() {
             .unwrap();
         accepted_tx.send(()).unwrap();
         // Retain the socket without returning an event or closing it.
-        let (tcp, _) = listener.accept().await.unwrap();
-        let mut fresh = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let mut fresh = loop {
+            let (tcp, _) = listener.accept().await.unwrap();
+            match tokio_tungstenite::accept_async(tcp).await {
+                Ok(fresh) => break fresh,
+                // Ordinary loopback HTTP requests are not the response socket.
+                // Keep waiting through the bounded cancellation drain, but do
+                // not hide malformed WebSocket handshakes or transport errors.
+                Err(tokio_tungstenite::tungstenite::Error::Protocol(
+                    tokio_tungstenite::tungstenite::error::ProtocolError::MissingConnectionUpgradeHeader,
+                )) => continue,
+                Err(error) => panic!("WebSocket reconnect handshake failed: {error}"),
+            }
+        };
         let request: Value =
             serde_json::from_str(fresh.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
         assert!(request.get("previous_response_id").is_none());

@@ -7,6 +7,7 @@ async fn overload_public_retry_case(recover: bool, partial: bool) {
     let addr = listener.local_addr().unwrap();
     let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
     let _idle = EnvVarGuard::set("JCODE_STREAM_IDLE_TIMEOUT_SECS", "1");
+    let _retries = EnvVarGuard::set("JCODE_MAX_RETRIES", "3");
     jcode_base::config::invalidate_config_cache();
     let server = tokio::spawn(async move {
         let mut attempts = 0;

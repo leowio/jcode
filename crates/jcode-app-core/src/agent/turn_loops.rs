@@ -206,16 +206,15 @@ impl Agent {
             let prompt_has_recent_tool_result = Self::messages_end_with_tool_result(send_messages);
             self.last_status_detail = None;
             self.provider.set_session_id(&self.session.id);
-            let completion = self
-                .provider
-                .complete_split(
-                    send_messages,
-                    &tools,
-                    &split_prompt.static_part,
-                    &split_prompt.dynamic_part,
-                    self.provider_session_id.as_deref(),
-                )
-                .await;
+            let completion = super::provider_retry::complete_split(
+                Arc::clone(&self.provider),
+                send_messages,
+                &tools,
+                &split_prompt.static_part,
+                &split_prompt.dynamic_part,
+                self.provider_session_id.as_deref(),
+            )
+            .await;
             self.sync_bound_account_route();
             let mut stream = match completion {
                 Ok(stream) => stream,

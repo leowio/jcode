@@ -454,19 +454,6 @@ const DEFAULT_MODEL: &str = jcode_provider_core::DEFAULT_CLAUDE_MODEL;
 /// API version header
 const API_VERSION: &str = "2023-06-01";
 
-/// Maximum number of retries for transient errors
-const MAX_RETRIES: u32 = 3;
-
-/// Attempt budget for pure transport faults (connection reset, DNS failure,
-/// HTTP/2 stream error). A Wi-Fi roam or DHCP renewal takes several seconds to
-/// settle, so the ~3s that [`MAX_RETRIES`] covers can fall entirely inside one
-/// blip. Six attempts back off ~1s, 2s, 4s, 8s, 16s (~31s of waiting).
-const TRANSPORT_MAX_RETRIES: u32 = 6;
-
-/// Extended transport retries stop once this much time has passed since the
-/// first failure, so slow per-attempt timeouts cannot stall a turn for minutes.
-const TRANSPORT_RETRY_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Base delay for exponential backoff (in milliseconds)
 const RETRY_BASE_DELAY_MS: u64 = 1000;
 
@@ -1857,31 +1844,36 @@ async fn run_stream_with_retries(
     // Track every model id we have already attempted so a retired/renamed
     // model only falls back to genuinely new candidates.
     let mut tried_models: Vec<String> = vec![original_model.clone()];
-    // Transport faults get a longer budget than other transient errors; the
-    // displayed maximum grows only once one has actually been seen.
-    let mut retry_max = MAX_RETRIES;
+    let config = jcode_base::config::config();
+    let retry_policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+        config.provider.max_retries,
+        std::time::Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1)),
+    );
+    let retry_max = retry_policy.max_attempts();
     let mut first_failure_at: Option<std::time::Instant> = None;
 
-    for attempt in 0..TRANSPORT_MAX_RETRIES {
+    for attempt in retry_policy.attempts() {
+        if tx.is_closed() {
+            return;
+        }
         if attempt > 0 {
-            // Exponential backoff with jitter: ~1s, ~2s, ~4s
-            let delay = jcode_provider_core::retry_after::retry_delay(
-                attempt,
-                RETRY_BASE_DELAY_MS,
-                next_retry_delay.take(),
-            );
+            let delay = retry_policy.delay(attempt, next_retry_delay.take(), RETRY_BASE_DELAY_MS);
             let _ = tx
                 .send(Ok(StreamEvent::ConnectionPhase {
                     phase: jcode_message_types::ConnectionPhase::Retrying {
-                        attempt: attempt + 1,
+                        attempt: attempt.saturating_add(1),
                         max: retry_max,
                     },
                 }))
                 .await;
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(delay) => {}
+            }
             jcode_base::logging::info(&format!(
                 "Retrying Anthropic API request (attempt {}/{})",
-                attempt + 1,
+                attempt.saturating_add(1),
                 retry_max
             ));
         }
@@ -1904,7 +1896,7 @@ async fn run_stream_with_retries(
         };
 
         let mut response_accepted = false;
-        match stream_response(
+        let response = stream_response(
             attempt_client,
             token.clone(),
             is_oauth,
@@ -1915,9 +1907,13 @@ async fn run_stream_with_retries(
             &direct_transport,
             &mut response_accepted,
             usage_label.as_deref(),
-        )
-        .await
-        {
+        );
+        let result = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            result = response => result,
+        };
+        match result {
             Ok(()) => {
                 let _ = attempt_guard.finish().await;
                 return; // Success
@@ -2143,10 +2139,7 @@ async fn run_stream_with_retries(
                     .elapsed();
                 let is_transport_fault =
                     jcode_provider_core::is_transient_transport_error(&error_str);
-                if should_retry_transient(&error_str, attempt, since_first_failure) {
-                    if is_transport_fault {
-                        retry_max = TRANSPORT_MAX_RETRIES;
-                    }
+                if should_retry_transient(&error_str, attempt, &retry_policy) {
                     if saw_output {
                         // The fault hit mid-stream after partial output reached
                         // the consumer. Tell it to discard the partial attempt
@@ -2158,14 +2151,14 @@ async fn run_stream_with_retries(
                         ));
                         let _ = tx
                             .send(Ok(StreamEvent::RetryRollback {
-                                attempt: attempt + 2,
+                                attempt: attempt.saturating_add(2),
                                 max: retry_max,
                             }))
                             .await;
                     } else {
                         jcode_base::logging::info(&format!("Transient error, will retry: {}", e));
                     }
-                    next_retry_delay = jcode_provider_core::retry_after::retry_after_from_error(&e);
+                    next_retry_delay = retry_policy.retry_after_from_error(&e);
                     last_error = Some(e);
                     continue;
                 }
@@ -2185,7 +2178,7 @@ async fn run_stream_with_retries(
                     let _ = tx
                         .send(Err(e.context(format!(
                             "Network unstable: {} attempts over {}s all failed at the transport level",
-                            attempt + 1,
+                            attempt.saturating_add(1),
                             since_first_failure.as_secs().max(1)
                         ))))
                         .await;
@@ -2202,7 +2195,7 @@ async fn run_stream_with_retries(
         let _ = tx
             .send(Err(anyhow::anyhow!(
                 "Failed after {} retries: {}",
-                TRANSPORT_MAX_RETRIES,
+                retry_max,
                 e
             )))
             .await;
@@ -2792,6 +2785,9 @@ mod account_failover_tests;
 
 #[cfg(test)]
 mod account_binding_tests;
+
+#[cfg(test)]
+mod configured_retry_tests;
 
 #[cfg(test)]
 mod sse_utf8_chunk_tests {
