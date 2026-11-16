@@ -863,7 +863,13 @@ pub(crate) fn build_header_lines(app: &dyn TuiState, width: u16) -> Vec<Line<'st
     let auth = app.auth_status();
     let active = ActiveCredentialOverrides::from_app(app);
     fit_header_lines(
-        build_header_lines_with_auth(app, width, &auth, active),
+        build_header_lines_with_auth(
+            app,
+            width,
+            &auth,
+            active,
+            crate::config::config().display.show_account_prompts,
+        ),
         width,
     )
 }
@@ -873,6 +879,7 @@ fn build_header_lines_with_auth(
     width: u16,
     auth: &AuthStatus,
     active: ActiveCredentialOverrides,
+    show_account_prompts: bool,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
     let align = ratatui::layout::Alignment::Left;
@@ -880,41 +887,43 @@ fn build_header_lines_with_auth(
 
     // Local startup inventory uses saved metadata only. SSH must never present
     // this machine's credentials as the remote server's inventory.
-    let (login_heading, auth_lines) = if let Some(host) = crate::tui::ssh_remote_host() {
-        // The native protocol reports the active route, not a complete remote
-        // credential inventory. Do not render the laptop's (or an empty)
-        // inventory as if it described providers configured on the server.
-        // Only the daemon's credential-free OAuth account report is shown.
-        match account_router::remote_lines(
-            &app.provider_name(),
-            app.startup_oauth_account_label().as_deref(),
-        ) {
-            Some(lines) if !lines.is_empty() => (
-                format!("Account router on {host} · /account to manage · /login to add"),
-                lines,
-            ),
-            _ => (format!("/login to authenticate on {host}"), Vec::new()),
-        }
-    } else {
-        (
-            "Account router · /account to manage · /login to add credential".to_string(),
-            account_router::lines(
-                auth,
-                active,
+    if show_account_prompts {
+        let (login_heading, auth_lines) = if let Some(host) = crate::tui::ssh_remote_host() {
+            // The native protocol reports the active route, not a complete remote
+            // credential inventory. Do not render the laptop's (or an empty)
+            // inventory as if it described providers configured on the server.
+            // Only the daemon's credential-free OAuth account report is shown.
+            match account_router::remote_lines(
                 &app.provider_name(),
                 app.startup_oauth_account_label().as_deref(),
-            ),
-        )
-    };
-    lines.push(
-        Line::from(Span::styled(
-            login_heading,
-            Style::default().fg(dim_color()),
-        ))
-        .alignment(align),
-    );
-    for line in auth_lines {
-        lines.push(line.alignment(align));
+            ) {
+                Some(lines) if !lines.is_empty() => (
+                    format!("Account router on {host} · /account to manage · /login to add"),
+                    lines,
+                ),
+                _ => (format!("/login to authenticate on {host}"), Vec::new()),
+            }
+        } else {
+            (
+                "Account router · /account to manage · /login to add credential".to_string(),
+                account_router::lines(
+                    auth,
+                    active,
+                    &app.provider_name(),
+                    app.startup_oauth_account_label().as_deref(),
+                ),
+            )
+        };
+        lines.push(
+            Line::from(Span::styled(
+                login_heading,
+                Style::default().fg(dim_color()),
+            ))
+            .alignment(align),
+        );
+        for line in auth_lines {
+            lines.push(line.alignment(align));
+        }
     }
 
     let mcps = app.mcp_servers();
@@ -1055,7 +1064,13 @@ pub(in crate::tui) fn build_header_sections(
     );
     let persistent_ms = start.elapsed().as_millis() - auth_ms - active_ms;
     let secondary = fit_header_lines(
-        build_header_lines_with_auth(app, width, &auth, active),
+        build_header_lines_with_auth(
+            app,
+            width,
+            &auth,
+            active,
+            crate::config::config().display.show_account_prompts,
+        ),
         width,
     );
     let total_ms = start.elapsed().as_millis();

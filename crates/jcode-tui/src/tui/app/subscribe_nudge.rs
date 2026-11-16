@@ -179,6 +179,9 @@ impl App {
     /// shown, and records the claim (session flag + weekly file) so a `true`
     /// must be followed by actually showing it.
     pub(super) fn claim_subscribe_nudge(&mut self, trigger: SubscribeNudgeTrigger) -> bool {
+        if !crate::config::config().display.show_account_prompts {
+            return false;
+        }
         // Deterministic playback and unit-test harnesses must not grow
         // marketing lines (golden transcripts assert exact output).
         if cfg!(test) || !matches!(self.runtime_mode, AppRuntimeMode::RemoteClient) {

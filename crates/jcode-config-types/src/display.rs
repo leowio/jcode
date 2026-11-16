@@ -15,6 +15,17 @@ mod block_streaming_tests {
             serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
         assert!(restored.block_streaming);
     }
+
+    #[test]
+    fn account_prompts_default_on_and_can_be_disabled() {
+        let default: DisplayConfig = serde_json::from_str("{}").unwrap();
+        assert!(default.show_account_prompts);
+        let disabled: DisplayConfig =
+            serde_json::from_str(r#"{"show_account_prompts":false}"#).unwrap();
+        let restored: DisplayConfig =
+            serde_json::from_value(serde_json::to_value(disabled).unwrap()).unwrap();
+        assert!(!restored.show_account_prompts);
+    }
 }
 
 use crate::{
@@ -91,6 +102,10 @@ pub struct DisplayConfig {
     /// Reveal complete paragraphs or one-second batches instead of paced characters.
     /// Display-only, applied when a TUI client starts (default: false).
     pub block_streaming: bool,
+    /// Show startup account/login hints and unsolicited hosted-account nudges.
+    /// Does not hide authentication errors or explicit account commands (default: true).
+    #[serde(default = "default_true")]
+    pub show_account_prompts: bool,
     /// Show a truncated preview of the previous prompt at the top when it scrolls out of view (default: true)
     pub prompt_preview: bool,
     /// Render swarm/file-activity notifications in a compact single-line form
@@ -253,6 +268,7 @@ impl Default for DisplayConfig {
             animation_fps: 60,
             redraw_fps: 60,
             block_streaming: false,
+            show_account_prompts: true,
             prompt_preview: true,
             compact_notifications: false,
             copy_badge_alt_label: String::new(),

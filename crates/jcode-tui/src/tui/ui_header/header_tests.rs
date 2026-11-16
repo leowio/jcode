@@ -9,6 +9,32 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 #[test]
+fn account_prompts_opt_out_removes_login_rows_from_rendered_header() {
+    let app = create_test_app();
+    let auth = app.auth_status();
+    let active = ActiveCredentialOverrides::from_app(&app);
+    for width in [40, 80, 120] {
+        for show in [true, false] {
+            let lines = build_header_lines_with_auth(&app, width, &auth, active, show);
+            let mut terminal = ratatui::Terminal::new(
+                ratatui::backend::TestBackend::new(width, 40),
+            ).unwrap();
+            terminal.draw(|frame| {
+                frame.render_widget(ratatui::widgets::Paragraph::new(lines), frame.area());
+            }).unwrap();
+            let rendered: String = terminal.backend().buffer().content().iter()
+                .map(|cell| cell.symbol()).collect();
+            if show {
+                assert!(rendered.contains("Account router"), "{rendered}");
+            } else {
+                assert!(!rendered.contains("Account router"), "{rendered}");
+                assert!(!rendered.contains("/login"), "{rendered}");
+            }
+        }
+    }
+}
+
+#[test]
 fn header_rows_clip_unicode_and_controls_without_losing_style() {
     let style = Style::default().fg(Color::Magenta);
     let source = vec![
