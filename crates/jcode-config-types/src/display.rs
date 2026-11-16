@@ -1,5 +1,22 @@
 //! `[display]` section of the config: TUI/CLI presentation settings.
 
+#[cfg(test)]
+mod block_streaming_tests {
+    use super::DisplayConfig;
+
+    #[test]
+    fn block_streaming_is_opt_in_and_round_trips() {
+        let default: DisplayConfig = serde_json::from_str("{}").unwrap();
+        assert!(!default.block_streaming);
+        let enabled: DisplayConfig =
+            serde_json::from_str(r#"{"block_streaming":true}"#).unwrap();
+        assert!(enabled.block_streaming);
+        let restored: DisplayConfig =
+            serde_json::from_value(serde_json::to_value(enabled).unwrap()).unwrap();
+        assert!(restored.block_streaming);
+    }
+}
+
 use crate::{
     DiagramDisplayMode, DiffDisplayMode, LatexRenderingMode, MarkdownSpacingMode,
     NativeScrollbarConfig, ReasoningDisplayMode, default_true,
@@ -71,6 +88,9 @@ pub struct DisplayConfig {
     pub animation_fps: u32,
     /// FPS for active redraw (processing, streaming): 1-120 (default: 30)
     pub redraw_fps: u32,
+    /// Reveal complete paragraphs or one-second batches instead of paced characters.
+    /// Display-only, applied when a TUI client starts (default: false).
+    pub block_streaming: bool,
     /// Show a truncated preview of the previous prompt at the top when it scrolls out of view (default: true)
     pub prompt_preview: bool,
     /// Render swarm/file-activity notifications in a compact single-line form
@@ -232,6 +252,7 @@ impl Default for DisplayConfig {
             performance: String::new(),
             animation_fps: 60,
             redraw_fps: 60,
+            block_streaming: false,
             prompt_preview: true,
             compact_notifications: false,
             copy_badge_alt_label: String::new(),

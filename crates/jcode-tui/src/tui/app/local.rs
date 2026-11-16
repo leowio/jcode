@@ -135,7 +135,11 @@ pub(super) fn handle_tick(app: &mut App) -> bool {
         app.pending_queued_dispatch = true;
         needs_redraw = true;
     }
-    let ops = app.stream_buffer.flush();
+    let ops = if app.stream_buffer.block_streaming_enabled() {
+        app.stream_buffer.flush_smooth_frame()
+    } else {
+        app.stream_buffer.flush()
+    };
     if app.apply_stream_ops(ops) {
         needs_redraw = true;
     }

@@ -412,7 +412,8 @@ impl App {
             resize_redraw_pending: false,
             mcp_server_names: Vec::new(),
             connection_phase_started: None,
-            stream_buffer: StreamBuffer::new(),
+            stream_buffer: StreamBuffer::new()
+                .with_block_streaming(crate::config::config().display.block_streaming),
             thinking_start: None,
             thought_line_inserted: false,
             thinking_buffer: String::new(),
@@ -925,7 +926,8 @@ impl App {
             resize_redraw_pending: false,
             mcp_server_names: Vec::new(), // Vec<(name, tool_count)>
             connection_phase_started: None,
-            stream_buffer: StreamBuffer::new(),
+            stream_buffer: StreamBuffer::new()
+                .with_block_streaming(crate::config::config().display.block_streaming),
             thinking_start: None,
             thought_line_inserted: false,
             thinking_buffer: String::new(),

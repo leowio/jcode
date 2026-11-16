@@ -53,6 +53,9 @@ const MAX_REVEAL_STEP: Duration = Duration::from_millis(50);
 /// Maximum jitter-recorder events retained per series (arrivals / reveals).
 const JITTER_EVENT_CAP: usize = 4096;
 
+/// Bound the wait for a paragraph, including while no further deltas arrive.
+const BLOCK_REVEAL_TIMEOUT: Duration = Duration::from_secs(1);
+
 /// Kind of streamed content moving through the buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum StreamKind {
@@ -85,6 +88,8 @@ enum QueuedOp {
 /// reasoning-region boundaries.
 pub struct StreamBuffer {
     queue: VecDeque<QueuedOp>,
+    block_streaming: bool,
+    block_pending_since: Option<Instant>,
     /// Cached total chars across queued chunks (markers cost nothing).
     backlog_chars: usize,
     last_reveal: Instant,
@@ -120,6 +125,8 @@ impl StreamBuffer {
     pub fn new() -> Self {
         Self {
             queue: VecDeque::new(),
+            block_streaming: false,
+            block_pending_since: None,
             backlog_chars: 0,
             last_reveal: Instant::now(),
             carry: 0.0,
@@ -130,6 +137,17 @@ impl StreamBuffer {
             max_step: MAX_REVEAL_STEP,
             jitter: JitterRecorder::default(),
         }
+    }
+
+    /// Select paragraph batching rather than character pacing. Hard-boundary
+    /// flushes and ordering are identical in either mode.
+    pub fn with_block_streaming(mut self, enabled: bool) -> Self {
+        self.block_streaming = enabled;
+        self
+    }
+
+    pub fn block_streaming_enabled(&self) -> bool {
+        self.block_streaming
     }
 
     /// Push answer text into the buffer, returning any paced ops ready to apply
@@ -173,6 +191,7 @@ impl StreamBuffer {
     /// Force flush the entire backlog (call on message end, commit, or
     /// interrupt). Returns every remaining op in order.
     pub fn flush(&mut self) -> Vec<StreamOp> {
+        self.block_pending_since = None;
         self.carry = 0.0;
         self.ceiling_carry = 0.0;
         self.last_reveal = Instant::now();
@@ -199,6 +218,7 @@ impl StreamBuffer {
     /// Clear the backlog without returning content.
     pub fn clear(&mut self) {
         self.queue.clear();
+        self.block_pending_since = None;
         self.backlog_chars = 0;
         self.carry = 0.0;
         self.ceiling_carry = 0.0;
@@ -234,6 +254,7 @@ impl StreamBuffer {
     /// Append a chunk, coalescing with the previous queue entry when it has the
     /// same kind so the queue stays short under token-level feeds.
     fn push_chunk(&mut self, kind: StreamKind, text: &str) {
+        self.block_pending_since.get_or_insert_with(Instant::now);
         self.backlog_chars += text.chars().count();
         self.jitter.record_arrival(kind, text.chars().count());
         if let Some(QueuedOp::Chunk {
@@ -255,6 +276,9 @@ impl StreamBuffer {
     /// elapsed time times a backlog-scaled rate, then drains that many chars
     /// (and any zero-cost markers reached along the way).
     fn reveal_now(&mut self, now: Instant) -> Vec<StreamOp> {
+        if self.block_streaming {
+            return self.reveal_blocks(now);
+        }
         if self.backlog_chars == 0 {
             // No chunk backlog: reset so an idle gap cannot bank reveal budget.
             self.carry = 0.0;
@@ -294,6 +318,46 @@ impl StreamBuffer {
         self.carry -= reveal as f32;
         self.ceiling_carry -= reveal as f32;
         self.drain_ops(reveal, false)
+    }
+
+    /// A content-kind boundary completes the preceding segment. Otherwise only
+    /// reveal through the last blank line. The timer starts at the first queued
+    /// character, not the latest arrival, so continuous deltas cannot starve it.
+    /// This deliberately does not try to parse unfinished Markdown fences/lists.
+    fn reveal_blocks(&mut self, now: Instant) -> Vec<StreamOp> {
+        if self.block_pending_since.is_some_and(|since| {
+            now.saturating_duration_since(since) >= BLOCK_REVEAL_TIMEOUT
+        }) {
+            // A timed reveal is not a message boundary: reasoning may still be
+            // open, and a later answer must queue its close marker as usual.
+            self.block_pending_since = None;
+            return self.drain_ops(self.backlog_chars, true);
+        }
+
+        let mut chars = 0;
+        for (index, op) in self.queue.iter().enumerate() {
+            if let QueuedOp::Chunk { text, .. } = op {
+                if index + 1 < self.queue.len() {
+                    chars += text.chars().count();
+                } else {
+                    let end = ["\n\n", "\r\n\r\n"]
+                        .iter()
+                        .filter_map(|separator| {
+                            text.rfind(*separator).map(|pos| pos + separator.len())
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    chars += text[..end].chars().count();
+                }
+            }
+        }
+        let ops = self.drain_ops(chars, false);
+        if self.queue.is_empty() {
+            self.block_pending_since = None;
+        } else if chars > 0 {
+            self.block_pending_since = Some(now);
+        }
+        ops
     }
 
     /// Drain up to `char_count` chunk characters from the front of the queue (on
@@ -536,6 +600,84 @@ fn percentile_usize(values: impl Iterator<Item = usize>, p: f64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_streaming_reveals_paragraphs_across_deltas() {
+        let mut buf = StreamBuffer::new().with_block_streaming(true);
+        assert!(buf.push_text("你好\n").is_empty());
+        assert_eq!(buf.push_text("\nnext"), vec![StreamOp::Text("你好\n\n".into())]);
+        assert!(buf.flush_smooth_frame().is_empty());
+        assert_eq!(buf.flush(), vec![StreamOp::Text("next".into())]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn block_streaming_accepts_windows_paragraph_breaks() {
+        let mut buf = StreamBuffer::new().with_block_streaming(true);
+        assert_eq!(
+            buf.push_text("one\r\n\r\ntwo\r\n\r\n尾"),
+            vec![StreamOp::Text("one\r\n\r\ntwo\r\n\r\n".into())]
+        );
+        assert_eq!(buf.flush(), vec![StreamOp::Text("尾".into())]);
+    }
+
+    #[test]
+    fn block_streaming_timeout_is_not_postponed_by_arrivals() {
+        let mut buf = StreamBuffer::new().with_block_streaming(true);
+        assert!(buf.push_text("long ").is_empty());
+        let start = buf.block_pending_since.unwrap();
+        assert!(buf.reveal_now(start + Duration::from_millis(999)).is_empty());
+        assert!(buf.push_text("paragraph").is_empty());
+        assert_eq!(buf.block_pending_since, Some(start));
+        assert_eq!(
+            buf.reveal_now(start + BLOCK_REVEAL_TIMEOUT),
+            vec![StreamOp::Text("long paragraph".into())]
+        );
+        assert!(buf.is_empty());
+        assert!(buf.block_pending_since.is_none());
+    }
+
+    #[test]
+    fn block_streaming_preserves_reasoning_order_and_timeout_state() {
+        let mut buf = StreamBuffer::new().with_block_streaming(true);
+        assert!(buf.push_reasoning("think").is_empty());
+        let start = buf.block_pending_since.unwrap();
+        assert_eq!(
+            buf.reveal_now(start + BLOCK_REVEAL_TIMEOUT),
+            vec![StreamOp::Reasoning("think".into())]
+        );
+        assert_eq!(buf.push_text("answer"), vec![StreamOp::CloseReasoning]);
+        assert_eq!(buf.flush(), vec![StreamOp::Text("answer".into())]);
+
+        assert!(buf.push_reasoning("more").is_empty());
+        assert_eq!(
+            buf.push_close_reasoning(),
+            vec![StreamOp::Reasoning("more".into()), StreamOp::CloseReasoning]
+        );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn block_streaming_flush_and_clear_reset_pending_timer_not_mode() {
+        let mut buf = StreamBuffer::new().with_block_streaming(true);
+        assert!(buf.push_text("cancelled").is_empty());
+        buf.clear();
+        assert!(buf.block_streaming_enabled());
+        assert!(buf.block_pending_since.is_none());
+        assert!(buf.push_text("replacement").is_empty());
+        assert_eq!(buf.flush(), vec![StreamOp::Text("replacement".into())]);
+        assert!(buf.block_pending_since.is_none());
+        assert!(buf.flush().is_empty());
+        assert!(buf.block_streaming_enabled());
+    }
+
+    #[test]
+    fn block_streaming_does_not_bank_idle_time() {
+        let mut buf = StreamBuffer::new().with_block_streaming(true);
+        assert!(buf.reveal_now(Instant::now() + Duration::from_secs(60)).is_empty());
+        assert!(buf.push_text("new burst").is_empty());
+        assert!(buf.flush_smooth_frame().is_empty());
+    }
 
     /// Sum chars of text+reasoning chunks in a batch of ops.
     fn op_chars(ops: &[StreamOp]) -> usize {

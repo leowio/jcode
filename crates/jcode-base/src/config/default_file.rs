@@ -305,6 +305,11 @@ prompt_entry_animation = true
 # Runtime policy may cap this lower on slower environments such as WSL/Windows Terminal.
 # redraw_fps = 60
 
+# Reveal paragraphs or one-second batches instead of character-by-character text.
+# Display-only, applies to answer and visible reasoning text. Restart the TUI client
+# after changing this. Completion, tool boundaries and interrupts flush immediately.
+# block_streaming = false
+
 # Label shown for the Alt/Option modifier in copy badges.
 # Empty = auto ("⌥" on macOS, "Alt" elsewhere). Examples: "Option", "Alt", "⌥".
 # copy_badge_alt_label = ""

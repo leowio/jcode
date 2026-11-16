@@ -1155,6 +1155,12 @@ fn handle_server_event_inner(
             let completes_resumed_turn =
                 app.current_message_id.is_none() && app.is_processing && has_resumed_turn_evidence;
             if app.current_message_id == Some(id) || completes_resumed_turn {
+                // Block mode has no animation to finish. Reveal the final partial
+                // paragraph now rather than waiting for its timeout after Done.
+                if app.stream_buffer.block_streaming_enabled() {
+                    let ops = app.stream_buffer.flush();
+                    app.apply_stream_ops(ops);
+                }
                 if !app.stream_buffer.is_empty() {
                     crate::logging::info(&format!(
                         "Deferring Done id={} until paced stream backlog drains",
@@ -1329,6 +1335,9 @@ fn handle_server_event_inner(
             // Account rotation already ran on the server. A structured offer
             // to switch providers must not become another retry of the spent
             // account just because its reason includes quota/reset timing.
+            if app.stream_buffer.block_streaming_enabled() {
+                app.commit_pending_streaming_assistant_message();
+            }
             let is_failover_prompt =
                 crate::provider::parse_failover_prompt_message(&message).is_some();
             let is_permanent_refresh_rejection =
@@ -3553,3 +3562,7 @@ use activity_notice::runtime_activity_status_notice;
 #[cfg(test)]
 #[path = "server_events/runtime_command_tests.rs"]
 mod runtime_command_tests;
+
+#[cfg(test)]
+#[path = "server_events/block_streaming_tests.rs"]
+mod block_streaming_tests;
