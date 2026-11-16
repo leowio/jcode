@@ -865,6 +865,7 @@ fn lane_prerequisite_progress(
 /// Render staged todos with a bounded row per lane and optional prerequisite
 /// progress. Later lanes retain phase dimming unless explicit prerequisites
 /// replace that barrier and have been satisfied.
+#[cfg(test)]
 pub(crate) fn push_stage_lines(
     lines: &mut Vec<Line<'static>>,
     todos: &[&crate::todo::TodoItem],
@@ -872,6 +873,21 @@ pub(crate) fn push_stage_lines(
     background_tasks: &[TodoCardBackgroundTask],
     base_indent: &str,
     inner_width: usize,
+) {
+    push_stage_lines_with_details(
+        lines, todos, agents, background_tasks, base_indent, inner_width, &[], &mut Vec::new(),
+    );
+}
+
+pub(super) fn push_stage_lines_with_details(
+    lines: &mut Vec<Line<'static>>,
+    todos: &[&crate::todo::TodoItem],
+    agents: &[TodoCardAgent],
+    background_tasks: &[TodoCardBackgroundTask],
+    base_indent: &str,
+    inner_width: usize,
+    expanded_lanes: &[String],
+    targets: &mut Vec<(usize, String)>,
 ) {
     let stages = ordered_layout(todos);
     let current = current_stage(&stages, todos);
@@ -919,6 +935,9 @@ pub(crate) fn push_stage_lines(
         // A lane wears its phase's colour: bold while its phase is active,
         // dimmed (with its titles and dots) while the phase has not started.
         let items = items_of(lane);
+        let key = items[0].id.clone();
+        let expanded = expanded_lanes.iter().any(|item| item == "*" || item == &key)
+            && !expanded_lanes.iter().any(|item| item == &format!("!{key}"));
         let prerequisites = lane_prerequisite_progress(&items, todos);
         let later = prerequisites.map_or_else(
             || current.is_some_and(|current| phase > current),
@@ -1023,6 +1042,7 @@ pub(crate) fn push_stage_lines(
                 row = row.into_iter().map(dim_span).collect();
             }
             lines.push(todo_card_line(row, base_indent, inner_width));
+            finish_pinned_lane(lines, &key, expanded, &items, base_indent, inner_width, targets);
             continue;
         }
         let mut row = lane_strip_spans(&statuses, strip_width);
@@ -1060,6 +1080,23 @@ pub(crate) fn push_stage_lines(
             row = row.into_iter().map(dim_span).collect();
         }
         lines.push(todo_card_line(row, base_indent, inner_width));
+        finish_pinned_lane(lines, &key, expanded, &items, base_indent, inner_width, targets);
+    }
+}
+
+fn finish_pinned_lane(
+    lines: &mut Vec<Line<'static>>,
+    key: &str,
+    expanded: bool,
+    items: &[&crate::todo::TodoItem],
+    base_indent: &str,
+    inner_width: usize,
+    targets: &mut Vec<(usize, String)>,
+) {
+    let row = lines.len().saturating_sub(1);
+    targets.push((row, key.to_string()));
+    if expanded {
+        push_expanded_todo_items(lines, items, base_indent, inner_width);
     }
 }
 

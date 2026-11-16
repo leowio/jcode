@@ -862,6 +862,14 @@ impl crate::tui::TuiState for App {
         self.pinned_todos_expanded
     }
 
+    fn pinned_todo_expanded_lanes(&self) -> &[String] {
+        &self.pinned_todo_expanded_lanes
+    }
+
+    fn pinned_intent_expanded(&self) -> bool {
+        self.pinned_intent_expanded
+    }
+
     fn justrust_status(&self) -> Option<&crate::tui::justrust_status::StatusRow> {
         self.justrust_status.row()
     }

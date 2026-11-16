@@ -10,7 +10,9 @@ mod todo_payload_cache_tests;
 mod todo_stages;
 pub(crate) use todo_stages::TodoCardAgent;
 pub(crate) use todo_stages::animate_lane_spinners;
-use todo_stages::{agent_roster_spans, push_stage_lines, push_stage_pips, render_todo_item_line};
+use todo_stages::{agent_roster_spans, push_stage_pips, render_todo_item_line};
+#[cfg(test)]
+use todo_stages::push_stage_lines;
 
 use super::*;
 #[path = "ui_messages_cache.rs"]
@@ -1118,11 +1120,45 @@ pub(crate) fn render_pinned_todos_message(
         .collect()
 }
 
-/// Intent stays visible when the task list is folded. Share the same payload
-/// cache and gutter as the detailed card so live updates cannot drift apart.
-pub(super) fn pinned_todo_summary(payload: &str, width: u16) -> (Vec<Line<'static>>, String) {
+pub(super) fn render_pinned_todos_with_details(
+    msg: &DisplayMessage,
+    width: u16,
+    diff_mode: crate::config::DiffDisplayMode,
+    expanded_lanes: &[String],
+) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
+    type CachedDisclosure = (
+        String, u16, crate::config::DiffDisplayMode, Vec<String>,
+        Vec<Line<'static>>, Vec<(usize, String)>,
+    );
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<CachedDisclosure>> = const { std::cell::RefCell::new(None) };
+    }
+    if let Some(hit) = CACHE.with_borrow(|cache| cache.as_ref()
+        .filter(|(content, cached_width, mode, lanes, _, _)| content == &msg.content && *cached_width == width && *mode == diff_mode && lanes == expanded_lanes)
+        .map(|(_, _, _, _, lines, targets)| (lines.clone(), targets.clone()))) {
+        return hit;
+    }
+    let mut targets = Vec::new();
+    let mut lines = render_todo_card_with_details(msg, width, diff_mode, false, expanded_lanes, &mut targets);
+    for (row, key) in &targets {
+        let expanded = expanded_lanes.iter().any(|item| item == "*" || item == key)
+            && !expanded_lanes.iter().any(|item| item == &format!("!{key}"));
+        if let Some(line) = lines.get_mut(*row) {
+            line.spans.insert(1.min(line.spans.len()), Span::styled(
+                if expanded { "▾ " } else { "▸ " }, Style::default().fg(todo_label_color()),
+            ));
+        }
+    }
+    CACHE.with_borrow_mut(|cache| {
+        *cache = (msg.content.len() <= MAX_CACHED_TODO_PAYLOAD_BYTES)
+            .then(|| (msg.content.clone(), width, diff_mode, expanded_lanes.to_vec(), lines.clone(), targets.clone()));
+    });
+    (lines, targets)
+}
+
+pub(super) fn pinned_todo_intent(payload: &str, width: u16, expanded: bool) -> (Vec<Line<'static>>, String, bool) {
     let Some(payload) = cached_todo_payload(payload) else {
-        return (Vec::new(), "Todos".to_string());
+        return (Vec::new(), "Todos".to_string(), false);
     };
     let mut intent = Vec::new();
     if let TodoCardPayload::Current { plan, .. } = payload.as_ref() {
@@ -1134,6 +1170,19 @@ pub(super) fn pinned_todo_summary(payload: &str, width: u16) -> (Vec<Line<'stati
             true,
         );
     }
+    let full_intent = if let TodoCardPayload::Current { plan, .. } = payload.as_ref() {
+        let text = plan.user_intention.as_deref().unwrap_or_default().split_whitespace().collect::<Vec<_>>().join(" ");
+        match plan.understands_user_intent {
+            Some(state) => format!("Intent {}: {text}", state.as_str()),
+            None if !text.is_empty() => format!("Intent: {text}"),
+            None => String::new(),
+        }
+    } else { String::new() };
+    let can_unwrap = full_intent.width() > usize::from(width.saturating_sub(2));
+    if expanded && can_unwrap {
+        intent = wrap_todo_detail(full_intent.trim(), usize::from(width.saturating_sub(4)).max(1))
+            .into_iter().map(|chunk| Line::styled(format!("  {chunk}"), Style::default().fg(todo_meta_color()))).collect();
+    }
     let todos = payload.todos();
     let completed = todos.iter().filter(|todo| todo.status == "completed").count();
     let cancelled = todos.iter().filter(|todo| todo.status == "cancelled").count();
@@ -1141,7 +1190,7 @@ pub(super) fn pinned_todo_summary(payload: &str, width: u16) -> (Vec<Line<'stati
     if cancelled > 0 {
         label.push_str(&format!(" · {cancelled} cancelled"));
     }
-    (intent, label)
+    (intent, label, can_unwrap)
 }
 
 fn render_todos_message_with_cap(
@@ -1149,6 +1198,17 @@ fn render_todos_message_with_cap(
     width: u16,
     diff_mode: crate::config::DiffDisplayMode,
     cap_width: bool,
+) -> Vec<Line<'static>> {
+    render_todo_card_with_details(msg, width, diff_mode, cap_width, &[], &mut Vec::new())
+}
+
+fn render_todo_card_with_details(
+    msg: &DisplayMessage,
+    width: u16,
+    diff_mode: crate::config::DiffDisplayMode,
+    cap_width: bool,
+    expanded_lanes: &[String],
+    targets: &mut Vec<(usize, String)>,
 ) -> Vec<Line<'static>> {
     let Ok(payload) = serde_json::from_str::<TodoCardPayload>(&msg.content) else {
         return render_system_message(msg, width, diff_mode);
@@ -1228,13 +1288,15 @@ fn render_todos_message_with_cap(
             ));
             let goal = todo_card_goal_for_group(&goals, None);
             push_todo_goal_details(&mut lines, goal, base_indent, inner_width, compact_details);
-            push_stage_lines(
+            todo_stages::push_stage_lines_with_details(
                 &mut lines,
                 &all_refs,
                 &agents,
                 &background_tasks,
                 base_indent,
                 inner_width,
+                expanded_lanes,
+                targets,
             );
         } else if has_groups {
             lines.push(render_todo_stage_status_header(
@@ -1263,15 +1325,19 @@ fn render_todos_message_with_cap(
                     base_indent,
                     inner_width,
                 ));
+                let key = items[0].id.clone();
+                targets.push((lines.len() - 1, key.clone()));
+                let expanded = expanded_lanes.iter().any(|item| item == "*" || item == &key)
+                    && !expanded_lanes.iter().any(|item| item == &format!("!{key}"));
                 push_todo_goal_details(&mut lines, goal, base_indent, inner_width, compact_details);
-                push_todo_item_lines(
-                    &mut lines,
-                    items,
-                    &agents,
-                    &background_tasks,
-                    base_indent,
-                    inner_width,
-                );
+                if expanded {
+                    push_expanded_todo_items(&mut lines, items, base_indent, inner_width);
+                    todo_stages::push_lane_status_lines_below_rows(&mut lines, items, &agents, base_indent, inner_width);
+                } else {
+                    push_todo_item_lines(
+                        &mut lines, items, &agents, &background_tasks, base_indent, inner_width,
+                    );
+                }
             }
         } else {
             let goal = todo_card_goal_for_group(&goals, None);
@@ -1284,14 +1350,19 @@ fn render_todos_message_with_cap(
             if goal.is_some() {
                 push_todo_goal_details(&mut lines, goal, base_indent, inner_width, compact_details);
             }
-            push_todo_item_lines(
-                &mut lines,
-                &all_refs,
-                &agents,
-                &background_tasks,
-                base_indent,
-                inner_width,
-            );
+            if expanded_lanes.iter().any(|item| item == "*") {
+                push_expanded_todo_items(&mut lines, &all_refs, base_indent, inner_width);
+                todo_stages::push_lane_status_lines_below_rows(&mut lines, &all_refs, &agents, base_indent, inner_width);
+            } else {
+                push_todo_item_lines(
+                    &mut lines,
+                    &all_refs,
+                    &agents,
+                    &background_tasks,
+                    base_indent,
+                    inner_width,
+                );
+            }
         }
     }
 
@@ -1632,6 +1703,48 @@ fn push_todo_item_lines(
         ));
     }
     todo_stages::push_lane_status_lines_below_rows(lines, todos, agents, base_indent, inner_width);
+}
+
+fn push_expanded_todo_items(
+    lines: &mut Vec<Line<'static>>,
+    todos: &[&crate::todo::TodoItem],
+    base_indent: &str,
+    inner_width: usize,
+) {
+    for todo in todos {
+        let spans = todo_card_item_spans(todo, false);
+        let glyph = spans[1].clone();
+        let available = inner_width.saturating_sub(4).max(1);
+        for (index, chunk) in wrap_todo_detail(&todo.content, available).into_iter().enumerate() {
+            lines.push(todo_card_line(vec![
+                Span::raw("  "),
+                if index == 0 { glyph.clone() } else { Span::raw("  ") },
+                Span::styled(chunk, spans[2].style),
+            ], base_indent, inner_width));
+        }
+        if let Some(description) = todo.details.as_deref().filter(|text| !text.trim().is_empty()) {
+            for chunk in wrap_todo_detail(description, available) {
+                lines.push(todo_card_line(vec![Span::raw("    "), Span::styled(chunk, Style::default().fg(todo_meta_color()))], base_indent, inner_width));
+            }
+        }
+        if let Some(confidence) = if todo.status == "completed" {
+            todo.completion_confidence.or(todo.confidence)
+        } else {
+            todo.confidence
+        } {
+            let label = if todo.status == "completed" && todo.completion_confidence.is_some() {
+                "Completion confidence"
+            } else {
+                "Agent confidence"
+            };
+            for chunk in wrap_todo_detail(&format!("{label}: {}", confidence.as_str()), available) {
+                lines.push(todo_card_line(vec![
+                    Span::raw("    "),
+                    Span::styled(chunk, Style::default().fg(todo_confidence_color())),
+                ], base_indent, inner_width));
+            }
+        }
+    }
 }
 
 fn wrap_todo_detail(value: &str, width: usize) -> Vec<String> {

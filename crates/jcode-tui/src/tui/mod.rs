@@ -742,10 +742,15 @@ pub trait TuiState {
     fn pinned_todos_payload(&self) -> Option<&str> {
         None
     }
-    /// Whether the pinned task list is open. Intent remains visible when folded.
-    /// Enabled by default so short plans do not require an extra click.
+    /// Whether all compact todo lanes should show their detailed task rows.
     fn pinned_todos_expanded(&self) -> bool {
-        true
+        false
+    }
+    fn pinned_todo_expanded_lanes(&self) -> &[String] {
+        &[]
+    }
+    fn pinned_intent_expanded(&self) -> bool {
+        false
     }
     /// Live build telemetry displayed below the pinned todo band.
     fn justrust_status(&self) -> Option<&justrust_status::StatusRow> {

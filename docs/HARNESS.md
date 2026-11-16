@@ -220,8 +220,12 @@ The former `external_blocker` and `completely_blocked` item fields were removed.
 
 Use `/todos pin` to toggle the pinned plan above the conversation. Intent and
 todos share a lighter, full-width background with horizontal and vertical
-padding. Click the **Todos** header to fold or expand the task list, including
-short plans. Folding keeps intent and the completion count visible. Expanded
+padding. Click a compact phase/lane row to expand its tasks into a detailed
+list, including full titles, descriptions, and the agent's confidence for each
+task (completion confidence for finished work). Click again to return to the
+compact row. The **Todos** header switches all lanes between compact and
+detailed views. Todos stay visible in both modes. Click a truncated **Intent**
+row to unwrap its full text, then click again to fold it to one line. Long
 plans scroll with the mouse wheel when they exceed the panel's height budget.
 Padding shrinks in short terminals to leave room for the conversation.
 

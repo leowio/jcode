@@ -352,6 +352,7 @@ pub(super) fn draw_messages(
     // the sticky previous-prompt preview, including at the top of the transcript.
     let (pinned_todo_band, pinned_todo_more_line) =
         pinned_todo_band_lines(app, text_render_area.width, render_area.height);
+    let pinned_todo_actions = PINNED_TODO_ROW_ACTIONS.with_borrow(Clone::clone);
     let pinned_todo_band_rows = pinned_todo_band.len() as u16;
     let max_scroll = compute_max_scroll_with_prompt_preview(
         total_lines,
@@ -446,6 +447,16 @@ pub(super) fn draw_messages(
             height: 1,
         }
     }));
+    if !super::secondary_render_active() {
+        PINNED_TODO_CLICK_AREAS.with_borrow_mut(|areas| {
+            *areas = pinned_todo_actions.into_iter().map(|(row, action)| (Rect {
+                x: text_render_area.x,
+                y: render_area.y.saturating_add(prompt_preview_lines).saturating_add(row as u16),
+                width: text_render_area.width,
+                height: 1,
+            }, action)).collect();
+        });
+    }
     // Total synthetic rows reserved at the top of the viewport (previous-prompt
     // preview first, then the todo band, then transcript content).
     let top_band_lines = pinned_todo_lines + prompt_preview_lines;
@@ -1392,9 +1403,11 @@ pub(crate) fn pinned_todo_band_lines(
     width: u16,
     viewport_height: u16,
 ) -> (Vec<Line<'static>>, Option<usize>) {
-    let (mut lines, more) = pinned_todo_band_lines_for_payload(
+    let (mut lines, more) = pinned_todo_band_with_details(
         app.pinned_todos_payload(),
         app.pinned_todos_expanded(),
+        app.pinned_todo_expanded_lanes(),
+        app.pinned_intent_expanded(),
         app.diff_mode(),
         width,
         viewport_height,
@@ -1436,26 +1449,59 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
     width: u16,
     viewport_height: u16,
 ) -> (Vec<Line<'static>>, Option<usize>) {
+    pinned_todo_band_with_details(payload, expanded, &[], false, diff_mode, width, viewport_height)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum PinnedTodoAction {
+    AllDetails,
+    Lane(String),
+    Intent,
+}
+
+thread_local! {
+    static PINNED_TODO_ROW_ACTIONS: std::cell::RefCell<Vec<(usize, PinnedTodoAction)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PINNED_TODO_CLICK_AREAS: std::cell::RefCell<Vec<(Rect, PinnedTodoAction)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub(crate) fn pinned_todo_action_at(x: u16, y: u16) -> Option<PinnedTodoAction> {
+    PINNED_TODO_CLICK_AREAS.with_borrow(|targets| targets.iter().find(|(area, _)| area.contains((x, y).into())).map(|(_, action)| action.clone()))
+}
+
+fn pinned_todo_band_with_details(
+    payload: Option<&str>,
+    expanded: bool,
+    expanded_lanes: &[String],
+    intent_expanded: bool,
+    diff_mode: crate::config::DiffDisplayMode,
+    width: u16,
+    viewport_height: u16,
+) -> (Vec<Line<'static>>, Option<usize>) {
+    if !super::secondary_render_active() {
+        PINNED_TODO_ROW_ACTIONS.with_borrow_mut(Vec::clear);
+    }
     if width < 16 || viewport_height < 3 {
         return (Vec::new(), None);
     }
 
     let content_width = width.saturating_sub(3);
-    let card_lines = if crate::config::config().display.pin_todos {
-        payload.map_or_else(Vec::new, |payload| {
-            // Distinct title keeps the line cache from sharing entries with
-            // the width-capped inline transcript card.
+    let (card_lines, lane_targets) = if crate::config::config().display.pin_todos {
+        payload.map_or_else(|| (Vec::new(), Vec::new()), |payload| {
+            // Pinned disclosure rendering has its own bounded cache, keyed by
+            // payload, width, and the expanded lane ids.
             let mut msg = crate::tui::DisplayMessage::todos(payload.to_string());
             msg.title = Some("Pinned todos".to_string());
-            super::messages::get_cached_message_lines(
+            let mut expanded_lanes = expanded_lanes.to_vec();
+            if expanded { expanded_lanes.push("*".to_string()); }
+            super::messages::render_pinned_todos_with_details(
                 &msg,
                 content_width,
                 diff_mode,
-                super::messages::render_pinned_todos_message,
+                &expanded_lanes,
             )
         })
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
     PINNED_TODO_LAST_MAX.store(0, std::sync::atomic::Ordering::Relaxed);
     if card_lines.is_empty() {
@@ -1464,10 +1510,17 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
     let mut card_lines = card_lines;
     super::messages::animate_lane_spinners(&mut card_lines);
 
-    let (intent, summary) =
-        super::messages::pinned_todo_summary(payload.unwrap_or_default(), content_width);
+    let (mut intent, summary, intent_can_unwrap) =
+        super::messages::pinned_todo_intent(payload.unwrap_or_default(), content_width, intent_expanded);
+    let source_intent_rows = usize::from(!intent.is_empty());
+    intent.truncate(usize::from(viewport_height.saturating_sub(5)).max(1));
+    if intent_can_unwrap && let Some(first) = intent.first_mut() {
+        first.spans.insert(1.min(first.spans.len()), Span::styled(
+            if intent_expanded { "▾ " } else { "▸ " }, Style::default().fg(tool_color()),
+        ));
+    }
     // Intent is fixed chrome, not part of the task list's scrolling window.
-    let task_lines = &card_lines[intent.len().min(card_lines.len())..];
+    let task_lines = &card_lines[source_intent_rows.min(card_lines.len())..];
     let padding = usize::from(viewport_height >= 9);
     let intent_gap = usize::from(!intent.is_empty() && viewport_height >= 12);
     let chrome_rows = padding * 2 + intent.len() + intent_gap + 1;
@@ -1477,7 +1530,7 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
         .max(chrome_rows + 1)
         .min(usize::from(viewport_height).saturating_sub(1));
     let window = budget.saturating_sub(chrome_rows);
-    let max_offset = if expanded && window > 0 {
+    let max_offset = if window > 0 {
         task_lines.len().saturating_sub(window)
     } else {
         0
@@ -1486,15 +1539,19 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
     PINNED_TODO_LAST_MAX.store(max_offset, std::sync::atomic::Ordering::Relaxed);
 
     let mut lines = vec![Line::raw(""); padding];
+    let mut actions = Vec::new();
+    if intent_can_unwrap {
+        actions.extend((padding..padding + intent.len()).map(|row| (row, PinnedTodoAction::Intent)));
+    }
     lines.extend(intent);
     lines.extend(std::iter::repeat_n(Line::raw(""), intent_gap));
     let toggle_line = lines.len();
     let mut label = format!(
         "  {} {summary} · click to {}",
         if expanded { "▾" } else { "▸" },
-        if expanded { "fold" } else { "expand" },
+        if expanded { "compact details" } else { "expand details" },
     );
-    if expanded && max_offset > 0 {
+    if max_offset > 0 {
         label.push_str(&format!(
             " · {}-{} of {} · scroll",
             offset + 1,
@@ -1503,8 +1560,16 @@ pub(crate) fn pinned_todo_band_lines_for_payload(
         ));
     }
     lines.push(Line::styled(label, Style::default().fg(tool_color()).bold()));
-    if expanded {
-        lines.extend(task_lines.iter().skip(offset).take(window).cloned());
+    actions.push((toggle_line, PinnedTodoAction::AllDetails));
+    for (source_row, key) in lane_targets {
+        let source_row = source_row.saturating_sub(source_intent_rows);
+        if source_row >= offset && source_row < offset + window {
+            actions.push((toggle_line + 1 + source_row - offset, PinnedTodoAction::Lane(key)));
+        }
+    }
+    lines.extend(task_lines.iter().skip(offset).take(window).cloned());
+    if !super::secondary_render_active() {
+        PINNED_TODO_ROW_ACTIONS.with_borrow_mut(|rows| *rows = actions);
     }
     lines.extend(std::iter::repeat_n(Line::raw(""), padding));
     let lines = lines
@@ -1583,7 +1648,7 @@ fn set_pinned_todo_band_area(area: Option<Rect>) {
     }
 }
 
-/// Screen rect of the pinned todo band, when it is scrollable (expanded with overflow).
+/// Screen rect of the pinned todo band when its content overflows.
 pub(crate) fn pinned_todo_scroll_area() -> Option<Rect> {
     if PINNED_TODO_MAX_SCROLL.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return None;

@@ -1552,8 +1552,10 @@ pub struct App {
     /// Last time the pinned todo band re-read todos from disk (1s throttle).
     #[allow(dead_code)]
     pinned_todos_checked_at: Option<Instant>,
-    /// Whether the pinned task list is open. Intent remains visible when folded.
+    /// Whether every compact lane is expanded into detailed task rows.
     pinned_todos_expanded: bool,
+    pinned_todo_expanded_lanes: Vec<String>,
+    pinned_intent_expanded: bool,
     /// Running and terminal background tasks shown beneath the pinned todo band.
     background_task_rows: Vec<crate::tui::BackgroundTaskRow>,
     /// Asynchronous, bounded queries of justrust's public live-status API.
