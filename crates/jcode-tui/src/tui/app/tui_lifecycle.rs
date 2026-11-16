@@ -19,7 +19,74 @@ impl App {
     }
 
     pub(super) fn schedule_pending_remote_retry(&mut self, reason: &str) -> bool {
-        self.schedule_pending_remote_retry_with_limit(reason, Self::AUTO_RETRY_MAX_ATTEMPTS)
+        self.schedule_pending_remote_retry_with_budget(
+            reason,
+            Self::AUTO_RETRY_MAX_ATTEMPTS,
+            Self::auto_retry_is_unlimited(),
+        )
+    }
+
+    pub(super) fn auto_retry_is_unlimited() -> bool {
+        crate::config::Config::load().provider.max_retries == u32::MAX
+    }
+
+    pub(super) fn transient_remote_retry_error(message: &str) -> bool {
+        if Self::permanent_remote_retry_error(message) {
+            return false;
+        }
+        let lower = message.to_ascii_lowercase();
+        if crate::network_retry::classify_message(message).is_some()
+            || jcode_provider_core::is_transient_transport_error(&lower)
+        {
+            return true;
+        }
+        [
+            "overloaded",
+            "service unavailable",
+            "temporarily unavailable",
+            "server_error",
+            "api_error",
+            "internal server error",
+            "rate limit",
+            "rate_limit",
+            "too many requests",
+            "did not complete within",
+            "stream disconnected before completion",
+            "incomplete message",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+            || lower
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| matches!(word, "429" | "500" | "502" | "503" | "504" | "529"))
+    }
+
+    pub(super) fn permanent_remote_retry_error(message: &str) -> bool {
+        let lower = message.to_ascii_lowercase();
+        lower.contains("unsafe_to_replay")
+            || super::commands::is_non_retryable_auto_poke_error(message)
+            || crate::auth::refresh_state::error_is_permanent_rejection(message)
+            || jcode_provider_core::is_definitive_usage_exhaustion(message)
+            || [
+                "invalid api key",
+                "invalid x-api-key",
+                "incorrect api key",
+                "api key not valid",
+                "authentication_error",
+                "no refresh token",
+                "credentials have been revoked",
+                "context limit exceeded",
+                "context window exceeded",
+                "prompt is too long",
+                "input is too long",
+                "too many tokens",
+                "guardrail",
+                "interrupted by user",
+                "cancelled",
+                "canceled",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
     }
 
     pub(super) fn schedule_pending_remote_network_wait(&mut self, reason: &str) -> bool {
@@ -37,18 +104,24 @@ impl App {
     /// A provider-specific failure (for example DNS for one host) can persist
     /// while the generic connectivity probe succeeds, so each forced wait
     /// consumes one attempt from the per-turn retry budget and returns `false`
-    /// once it is spent. Offline probe re-waits (`force == false`) do not
+    /// once it is spent, unless unlimited retries were configured. Offline
+    /// probe re-waits (`force == false`) do not
     /// consume attempts because no request was sent.
     pub(super) fn schedule_pending_remote_network_wait_with_force(
         &mut self,
         reason: &str,
         force: bool,
     ) -> bool {
+        let unlimited = Self::auto_retry_is_unlimited();
+        let retry_cap = crate::config::Config::load()
+            .provider
+            .retry_backoff_cap_secs
+            .max(1);
         let Some(pending) = self.rate_limit_pending_message.as_mut() else {
             return false;
         };
         if force {
-            if pending.retry_attempts >= Self::AUTO_RETRY_MAX_ATTEMPTS {
+            if !unlimited && pending.retry_attempts >= Self::AUTO_RETRY_MAX_ATTEMPTS {
                 return false;
             }
             pending.retry_attempts = pending.retry_attempts.saturating_add(1);
@@ -62,8 +135,13 @@ impl App {
         }
 
         let plan = crate::network_retry::wait_plan();
-        let retry_at =
-            Instant::now() + Duration::from_secs(5 * u64::from(pending.retry_attempts.max(1)));
+        let backoff_secs = 5 * u64::from(pending.retry_attempts.max(1));
+        let backoff_secs = if unlimited {
+            backoff_secs.min(retry_cap)
+        } else {
+            backoff_secs
+        };
+        let retry_at = Instant::now() + Duration::from_secs(backoff_secs);
         pending.retry_at = Some(retry_at);
         self.rate_limit_reset = Some(retry_at);
         self.status = ProcessingStatus::WaitingForNetwork {
@@ -104,6 +182,21 @@ impl App {
         reason: &str,
         max_attempts: u8,
     ) -> bool {
+        // Explicit small budgets are also used for deterministic failures and
+        // failover; unlimited transport retries must not widen those budgets.
+        self.schedule_pending_remote_retry_with_budget(reason, max_attempts, false)
+    }
+
+    fn schedule_pending_remote_retry_with_budget(
+        &mut self,
+        reason: &str,
+        max_attempts: u8,
+        unlimited: bool,
+    ) -> bool {
+        let retry_cap = crate::config::Config::load()
+            .provider
+            .retry_backoff_cap_secs
+            .max(1);
         let Some(pending) = self.rate_limit_pending_message.as_mut() else {
             return false;
         };
@@ -112,12 +205,17 @@ impl App {
         }
         let outcome = {
             let current_attempts = pending.retry_attempts;
-            if current_attempts >= max_attempts {
+            if !unlimited && current_attempts >= max_attempts {
                 Err(current_attempts)
             } else {
-                pending.retry_attempts += 1;
+                pending.retry_attempts = pending.retry_attempts.saturating_add(1);
                 let retry_attempts = pending.retry_attempts;
                 let backoff_secs = Self::AUTO_RETRY_BASE_DELAY_SECS * u64::from(retry_attempts);
+                let backoff_secs = if unlimited {
+                    backoff_secs.min(retry_cap)
+                } else {
+                    backoff_secs
+                };
                 let retry_at = Instant::now() + Duration::from_secs(backoff_secs);
                 pending.retry_at = Some(retry_at);
                 Ok((retry_attempts, backoff_secs, retry_at))
@@ -139,9 +237,13 @@ impl App {
             Ok((retry_attempts, backoff_secs, retry_at)) => {
                 self.rate_limit_reset = Some(retry_at);
                 let content = format!(
-                    "⚡ Connection lost - retrying (attempt {}/{}, in {}s) - {}",
+                    "⚡ Connection lost - retrying (attempt {}{}, in {}s) - {}",
                     retry_attempts,
-                    max_attempts,
+                    if unlimited {
+                        String::new()
+                    } else {
+                        format!("/{max_attempts}")
+                    },
                     backoff_secs,
                     reason
                         .trim()
@@ -182,6 +284,7 @@ impl App {
     pub(super) fn clear_pending_remote_retry(&mut self) {
         self.rate_limit_pending_message = None;
         self.rate_limit_reset = None;
+        self.clear_retrying_outcome();
     }
 
     /// Stop automatically resuming a held turn whose retry budget is spent.

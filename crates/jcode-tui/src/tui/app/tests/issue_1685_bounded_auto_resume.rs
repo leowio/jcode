@@ -29,6 +29,151 @@ fn issue_1685_error(
     }
 }
 
+fn with_unlimited_remote_retry(f: impl FnOnce()) {
+    // Unlimited retry config must not leak into concurrently running bounded
+    // retry tests, which intentionally use the default three-resume budget.
+    let name = std::thread::current().name().unwrap().to_string();
+    if std::env::var("JCODE_UNLIMITED_RETRY_TEST").as_deref() == Ok(name.as_str()) {
+        with_temp_jcode_home(|| {
+            let _retry_env = EnvRestoreGuard::set("JCODE_MAX_RETRIES", u32::MAX.to_string());
+            crate::config::Config::invalidate_cache();
+            assert!(App::auto_retry_is_unlimited());
+            f();
+        });
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &name, "--test-threads=1", "--nocapture"])
+        .env("JCODE_UNLIMITED_RETRY_TEST", &name)
+        .env("JCODE_HOME", home.path())
+        .output()
+        .expect("run isolated unlimited retry test");
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unlimited_remote_retry_saturates_and_caps_backoff() {
+    with_unlimited_remote_retry(|| {
+        let mut app = create_test_app();
+        app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", true, u8::MAX));
+        for _ in 0..20 {
+            assert!(app.schedule_pending_remote_retry("temporary service failure"));
+            let pending = app.rate_limit_pending_message.as_ref().unwrap();
+            assert_eq!(pending.retry_attempts, u8::MAX);
+            let wait = pending
+                .retry_at
+                .unwrap()
+                .saturating_duration_since(Instant::now());
+            assert!(wait <= Duration::from_secs(30));
+        }
+        let notice = &app.display_messages().last().unwrap().content;
+        assert!(notice.contains("attempt 255,"), "{notice}");
+        assert!(!notice.contains("255/3"), "{notice}");
+        assert!(!app.schedule_pending_remote_retry_with_limit("deterministic recovery", 2));
+    });
+}
+
+#[test]
+fn unlimited_remote_retry_holds_transient_errors_past_old_limits() {
+    with_unlimited_remote_retry(|| {
+        for (message, hint) in [
+            ("HTTP 503 Service Unavailable", None),
+            ("Stream read timeout: no data received", None),
+            ("429 Too Many Requests: rate_limit_error", Some(130_000)),
+            (
+                "429 rate_limit_error: {\"retry_after_seconds\":130000}",
+                None,
+            ),
+        ] {
+            let mut app = create_test_app();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            let mut remote = crate::tui::backend::RemoteConnection::dummy();
+            app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", false, u8::MAX));
+            app.last_submitted_input = Some("continue".into());
+            app.is_processing = true;
+            app.handle_server_event(issue_1685_error(42, message, hint), &mut remote);
+            let pending = app.rate_limit_pending_message.as_ref().expect(message);
+            assert_eq!(pending.retry_attempts, u8::MAX, "{message}");
+            let wait = app
+                .rate_limit_reset
+                .expect(message)
+                .saturating_duration_since(Instant::now());
+            if hint.is_some() || message.contains("retry_after_seconds") {
+                assert!(wait > Duration::from_secs(129_999), "{wait:?}");
+            } else {
+                assert!(pending.auto_retry, "{message}");
+                assert!(wait <= Duration::from_secs(30));
+            }
+        }
+    });
+}
+
+#[test]
+fn unlimited_remote_retry_stops_permanent_errors_before_network_or_rate_waits() {
+    with_unlimited_remote_retry(|| {
+        for message in [
+            "401 Unauthorized then connection reset",
+            "invalid API key: connection reset, please try again",
+            "invalid_request_error: Invalid request",
+            "insufficient_quota: usage_limit_reached",
+            "unsafe_to_replay: connection reset after native tools",
+            "an unexplained failure with no transient details",
+        ] {
+            let mut app = create_test_app();
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            let mut remote = crate::tui::backend::RemoteConnection::dummy();
+            app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", true, 0));
+            app.last_submitted_input = Some("continue".into());
+            app.is_processing = true;
+            let hint = (!message.starts_with("an unexplained")).then_some(1);
+            app.handle_server_event(issue_1685_error(42, message, hint), &mut remote);
+            assert!(app.rate_limit_pending_message.is_none(), "{message}");
+            assert!(app.rate_limit_reset.is_none(), "{message}");
+            assert!(!App::transient_remote_retry_error(message), "{message}");
+        }
+    });
+}
+
+#[test]
+fn unlimited_retry_phase_roundtrips_and_cancelled_turn_stays_cancelled() {
+    with_unlimited_remote_retry(|| {
+        let mut app = create_test_app();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        app.handle_server_event(
+            crate::protocol::ServerEvent::ConnectionPhase {
+                phase: "retrying (12/unlimited)".into(),
+            },
+            &mut remote,
+        );
+        assert!(matches!(
+            app.status,
+            ProcessingStatus::Connecting(crate::message::ConnectionPhase::Retrying {
+                attempt: 12,
+                max: u32::MAX
+            })
+        ));
+        app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", true, 0));
+        assert!(app.schedule_pending_remote_retry("HTTP 503"));
+        app.clear_pending_remote_retry();
+        app.handle_server_event(
+            issue_1685_error(42, "HTTP 503 Service Unavailable", None),
+            &mut remote,
+        );
+        assert!(app.rate_limit_pending_message.is_none());
+        assert!(app.rate_limit_reset.is_none());
+    });
+}
+
 #[test]
 fn issue_1685_openference_json_rate_limit_uses_retry_after_seconds_not_max_rpm() {
     let mut app = create_test_app();
@@ -226,9 +371,12 @@ fn accepted_stream_timeouts_do_not_restart_provider_retry_budget() {
             assert!(!app.auto_poke_incomplete_todos, "{error}");
             assert!(!app.auto_poke_default_on, "{error}");
             assert_eq!(app.input, "keep going", "{error}");
-            assert!(app.display_messages().iter().any(|message| {
-                message.content.contains("provider stream stalled")
-            }), "{error}");
+            assert!(
+                app.display_messages()
+                    .iter()
+                    .any(|message| { message.content.contains("provider stream stalled") }),
+                "{error}"
+            );
         }
     }
 }

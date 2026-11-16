@@ -896,7 +896,16 @@ fn handle_server_event_inner(
                     let inner = &phase[10..phase.len() - 1];
                     let (attempt, max) = inner
                         .split_once('/')
-                        .and_then(|(a, m)| Some((a.parse::<u32>().ok()?, m.parse::<u32>().ok()?)))
+                        .and_then(|(a, m)| {
+                            Some((
+                                a.parse::<u32>().ok()?,
+                                if m == "unlimited" {
+                                    u32::MAX
+                                } else {
+                                    m.parse::<u32>().ok()?
+                                },
+                            ))
+                        })
                         .unwrap_or((1, 1));
                     crate::message::ConnectionPhase::Retrying { attempt, max }
                 }
@@ -1089,6 +1098,7 @@ fn handle_server_event_inner(
             }
             app.push_display_message(DisplayMessage::system("Interrupted"));
             app.is_processing = false;
+            app.note_turn_interrupted();
             app.status = ProcessingStatus::Idle;
             app.stream_message_ended = false;
             app.processing_started = None;
@@ -1213,6 +1223,7 @@ fn handle_server_event_inner(
                 }
                 crate::tui::mermaid::clear_streaming_preview_diagram();
                 app.is_processing = false;
+                app.note_turn_done(app.turn_guardrail_stopped);
                 app.status = ProcessingStatus::Idle;
                 app.stream_message_ended = false;
                 // Turn completed successfully; drop the saved prompt so a later
@@ -1342,17 +1353,39 @@ fn handle_server_event_inner(
                 crate::provider::parse_failover_prompt_message(&message).is_some();
             let is_permanent_refresh_rejection =
                 crate::auth::refresh_state::error_is_permanent_rejection(&message);
-            let reset_duration = if is_failover_prompt || is_permanent_refresh_rejection {
+            let unlimited_retries = App::auto_retry_is_unlimited();
+            let permanent_retry_error = App::permanent_remote_retry_error(&message);
+            let reset_duration = if is_failover_prompt
+                || is_permanent_refresh_rejection
+                || (unlimited_retries && permanent_retry_error)
+            {
                 None
             } else {
                 retry_after_secs
-                    .map(|secs| Duration::from_secs(secs.min(MAX_TURN_HOLD_SECS)))
+                    .or_else(|| {
+                        if !unlimited_retries {
+                            return None;
+                        }
+                        message.match_indices('{').take(8).find_map(|(index, _)| {
+                            jcode_provider_core::retry_after::retry_after_body_seconds(
+                                &message[index..],
+                            )
+                        })
+                    })
+                    .map(|secs| {
+                        Duration::from_secs(if unlimited_retries {
+                            secs
+                        } else {
+                            secs.min(MAX_TURN_HOLD_SECS)
+                        })
+                    })
                     .or_else(|| parse_rate_limit_error(&message))
+                    .filter(|duration| Instant::now().checked_add(*duration).is_some())
             };
-            // A stale reset or a limit that never clears must not resend the
-            // same turn forever. Rate-limit holds share the per-turn retry
-            // budget, which begin_remote_send carries across resends.
-            let rate_limit_retry_exhausted = reset_duration.is_some()
+            // Rate-limit holds share the per-turn budget unless unlimited
+            // transient retries were explicitly configured.
+            let rate_limit_retry_exhausted = !unlimited_retries
+                && reset_duration.is_some()
                 && app
                     .rate_limit_pending_message
                     .as_ref()
@@ -1373,6 +1406,7 @@ fn handle_server_event_inner(
                     app.set_status_notice("Rate limited; queued retry");
                 }
                 app.is_processing = false;
+                app.note_turn_retrying(App::compact_provider_failure(&message));
                 app.status = ProcessingStatus::Idle;
                 app.stream_message_ended = false;
                 app.processing_started = None;
@@ -1408,6 +1442,7 @@ fn handle_server_event_inner(
                 });
             }
             app.is_processing = false;
+            app.note_turn_failed(App::compact_provider_failure(&message));
             app.status = ProcessingStatus::Idle;
             app.stream_message_ended = false;
             let recovered_local = recover_local_interleave_to_queue(app, "request error");
@@ -1481,6 +1516,14 @@ fn handle_server_event_inner(
                 app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return false;
             }
+            if unlimited_retries && permanent_retry_error {
+                app.pause_exhausted_auto_resume(
+                    "Stopped automatic retries: this request needs a change to its credentials, quota, model, or content before it can succeed. Your message is back in the input box.".to_string(),
+                    "Stopped: request needs attention",
+                );
+                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
+                return false;
+            }
             // Stream-idle failures follow an accepted request. The provider
             // owns transport retries and fallback already. A network probe
             // cannot fix these and must not restart that entire retry budget.
@@ -1489,7 +1532,7 @@ fn handle_server_event_inner(
                 .contains("stream read timeout: no data received")
                 || lower_message.contains("timed out waiting for next websocket activity")
                 || lower_message.contains("did not complete within");
-            if is_stream_idle_timeout {
+            if is_stream_idle_timeout && !unlimited_retries {
                 app.pause_exhausted_auto_resume(
                     "Stopped automatic retries: the provider stream stalled after the request was accepted. Your message is back in the input box. Retry manually, reduce the conversation with /compact, or choose another route with /model.".to_string(),
                     "Paused: provider stream stopped responding",
@@ -1499,9 +1542,9 @@ fn handle_server_event_inner(
             }
             // Connection-establishment failures can recover when the network
             // returns. Keep these separate from accepted but stalled streams.
-            let is_connectivity_error =
-                crate::tui::app::commands::is_auto_poke_connectivity_error(&message)
-                    || crate::network_retry::classify_message(&message).is_some();
+            let is_connectivity_error = !is_stream_idle_timeout
+                && (crate::tui::app::commands::is_auto_poke_connectivity_error(&message)
+                    || crate::network_retry::classify_message(&message).is_some());
             if is_connectivity_error
                 && app.schedule_pending_remote_network_wait_with_force(&message, true)
             {
@@ -1585,6 +1628,19 @@ fn handle_server_event_inner(
                     failed_fallback_payload.clone(),
                 );
                 return false;
+            }
+            if unlimited_retries {
+                if !App::transient_remote_retry_error(&message) {
+                    app.pause_exhausted_auto_resume(
+                        "Stopped automatic retries: the provider did not report a transient failure. Your message is back in the input box.".to_string(),
+                        "Stopped: request needs attention",
+                    );
+                    app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
+                    return false;
+                }
+                if let Some(pending) = app.rate_limit_pending_message.as_mut() {
+                    pending.auto_retry = true;
+                }
             }
             if !is_failover_prompt && !app.schedule_pending_remote_retry("⚠ Remote request failed.")
             {
@@ -3566,3 +3622,7 @@ mod runtime_command_tests;
 #[cfg(test)]
 #[path = "server_events/block_streaming_tests.rs"]
 mod block_streaming_tests;
+
+#[cfg(test)]
+#[path = "server_events/outcome_status_tests.rs"]
+mod outcome_status_tests;
