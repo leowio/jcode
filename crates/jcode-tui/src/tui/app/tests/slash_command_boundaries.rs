@@ -47,6 +47,25 @@ fn multiple_known_slash_commands_dispatch_in_order() {
 }
 
 #[test]
+fn compact_rebuild_is_a_local_command_without_starting_a_turn() {
+    let mut app = create_test_app();
+    assert!(super::commands_dispatch::dispatch_local_command(
+        &mut app,
+        "/compact --rebuild"
+    ));
+    assert!(!app.pending_turn && !app.is_processing);
+    let message = app.display_messages().last().unwrap();
+    assert!(
+        message.content.contains("No compacted history to rebuild")
+            || message
+                .content
+                .contains("Manual compaction is not available"),
+        "{}",
+        message.content
+    );
+}
+
+#[test]
 fn embedded_known_slash_command_after_whitespace_is_dispatched() {
     let mut app = create_test_app();
 

@@ -151,6 +151,9 @@ pub struct CompactionManager {
     /// Background compaction task handle
     pending_task: Option<JoinHandle<Result<CompactionResult>>>,
 
+    /// A rebuild replaces the existing compacted prefix instead of advancing it.
+    pending_rebuild: Option<rebuild::RebuildSnapshot>,
+
     /// User-facing trigger label for the currently running background compaction.
     pending_trigger: Option<String>,
 
@@ -221,6 +224,7 @@ impl CompactionManager {
             active_summary: None,
             active_chars: ActiveCharEstimate::default(),
             pending_task: None,
+            pending_rebuild: None,
             pending_trigger: None,
             pending_cutoff: 0,
             total_turns: 0,
@@ -242,6 +246,9 @@ impl CompactionManager {
 
     /// Reset all compaction state
     pub fn reset(&mut self) {
+        if let Some(task) = self.pending_task.take() {
+            task.abort();
+        }
         *self = Self::new();
     }
 
@@ -366,7 +373,10 @@ impl CompactionManager {
         state: &crate::session::StoredCompactionState,
         total_messages: usize,
     ) {
-        self.pending_task = None;
+        if let Some(task) = self.pending_task.take() {
+            task.abort();
+        }
+        self.pending_rebuild = None;
         self.pending_trigger = None;
         self.pending_cutoff = 0;
         self.observed_input_tokens = None;
@@ -1207,6 +1217,12 @@ impl CompactionManager {
         // Get result
         match futures::executor::block_on(task) {
             Ok(Ok(result)) => {
+                if let Some(snapshot) = self.pending_rebuild.take() {
+                    self.apply_rebuilt_compaction(snapshot, result, all_messages);
+                    self.pending_trigger = None;
+                    self.pending_cutoff = 0;
+                    return;
+                }
                 let trigger = self
                     .pending_trigger
                     .clone()
@@ -1316,11 +1332,13 @@ impl CompactionManager {
             }
             Ok(Err(e)) => {
                 crate::logging::error(&format!("[compaction] Failed to generate summary: {}", e));
+                self.pending_rebuild = None;
                 self.pending_trigger = None;
                 self.pending_cutoff = 0;
             }
             Err(e) => {
                 crate::logging::error(&format!("[compaction] Task panicked: {}", e));
+                self.pending_rebuild = None;
                 self.pending_trigger = None;
                 self.pending_cutoff = 0;
             }
@@ -1550,6 +1568,7 @@ impl CompactionManager {
         // we're committed to the hard compact.
         if let Some(task) = self.pending_task.take() {
             task.abort();
+            self.pending_rebuild = None;
             crate::logging::warn(&format!(
                 "[compaction] Aborting in-flight background compaction (pending_cutoff={}, trigger={:?}) — superseded by hard compact",
                 self.pending_cutoff, self.pending_trigger,
@@ -1868,6 +1887,9 @@ fn looks_like_refusal(text: &str) -> bool {
 #[path = "compaction_transfer.rs"]
 mod transfer;
 pub use transfer::build_transfer_compaction_state;
+
+#[path = "compaction_rebuild.rs"]
+mod rebuild;
 
 #[cfg(test)]
 #[path = "compaction_tests.rs"]

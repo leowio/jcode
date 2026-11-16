@@ -3531,7 +3531,8 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
         return true;
     }
 
-    if trimmed == "/compact" {
+    if trimmed == "/compact" || trimmed == "/compact --rebuild" {
+        let rebuild = trimmed == "/compact --rebuild";
         if !app.provider.supports_compaction() {
             app.push_display_message(DisplayMessage::system(
                 "Manual compaction is not available for this provider.".to_string(),
@@ -3563,7 +3564,12 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                     }
                 );
 
-                match manager.force_compact_with(&provider_messages, app.provider.clone()) {
+                let result = if rebuild {
+                    manager.rebuild_compaction_with(&provider_messages, app.provider.clone())
+                } else {
+                    manager.force_compact_with(&provider_messages, app.provider.clone())
+                };
+                match result {
                     Ok(()) => {
                         app.set_status_notice(App::format_compaction_progress_notice(
                             std::time::Duration::ZERO,
@@ -3575,7 +3581,11 @@ pub(super) fn handle_config_command(app: &mut App, trimmed: &str) -> bool {
                                 The summary will be applied automatically when ready.\n\
                                 Use /help compact for details.",
                                 status_msg,
-                                App::format_compaction_started_message("manual")
+                                if rebuild {
+                                    "📦 Rebuilding a text summary from retained history. The current summary stays available until its replacement is ready.".to_string()
+                                } else {
+                                    App::format_compaction_started_message("manual")
+                                }
                             ),
                             tool_calls: vec![],
                             duration_secs: None,

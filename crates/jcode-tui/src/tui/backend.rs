@@ -1376,6 +1376,14 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Replace native compaction with a text summary of the retained history.
+    pub async fn rebuild_compaction(&mut self) -> Result<u64> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::RebuildCompaction { id }).await?;
+        Ok(id)
+    }
+
     /// Trigger immediate memory extraction on the server for the active session.
     pub async fn trigger_memory_extraction(&mut self) -> Result<()> {
         let id = self.next_request_id;

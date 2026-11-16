@@ -1,4 +1,18 @@
 #[test]
+fn rebuild_compaction_uses_a_distinct_request() -> Result<()> {
+    let request: Request = serde_json::from_str(r#"{"type":"rebuild_compaction","id":42}"#)?;
+    assert!(matches!(request, Request::RebuildCompaction { id: 42 }));
+    assert_eq!(request.id(), 42);
+    assert_eq!(
+        serde_json::to_value(request)?,
+        serde_json::json!({"type": "rebuild_compaction", "id": 42})
+    );
+    let legacy: Request = serde_json::from_str(r#"{"type":"compact","id":7}"#)?;
+    assert!(matches!(legacy, Request::Compact { id: 7 }));
+    Ok(())
+}
+
+#[test]
 fn provider_oauth_account_label_defaults_and_roundtrips() -> Result<()> {
     for legacy in [
         r#"{"type":"history","id":1,"session_id":"test","messages":[]}"#,
@@ -1034,10 +1048,9 @@ fn history_prefix_fingerprint_is_stable_and_streaming_consistent() {
 
 #[test]
 fn history_delta_fields_are_backward_compatible() {
-    let event: ServerEvent = serde_json::from_str(
-        r#"{"type":"history","id":1,"session_id":"s","messages":[]}"#,
-    )
-    .expect("legacy History without messages_base_count");
+    let event: ServerEvent =
+        serde_json::from_str(r#"{"type":"history","id":1,"session_id":"s","messages":[]}"#)
+            .expect("legacy History without messages_base_count");
     let ServerEvent::History {
         messages_base_count,
         ..

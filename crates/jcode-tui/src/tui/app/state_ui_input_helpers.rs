@@ -875,6 +875,10 @@ impl App {
 
         if prefix.starts_with("/compact ") {
             let suggestions = vec![
+                (
+                    "/compact --rebuild".into(),
+                    "Rebuild a text summary from retained history",
+                ),
                 ("/compact mode".into(), "Show/change compaction mode"),
                 (
                     "/compact mode status".into(),

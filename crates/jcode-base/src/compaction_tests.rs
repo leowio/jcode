@@ -3,6 +3,283 @@ use crate::provider::{EventStream, Provider};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
+struct RebuildTestProvider {
+    prompts: Arc<std::sync::Mutex<Vec<String>>>,
+    response: &'static str,
+    fail: bool,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+}
+
+impl RebuildTestProvider {
+    fn new() -> Self {
+        Self {
+            prompts: Default::default(),
+            response: "Rebuilt context, decisions, and remaining work.",
+            fail: false,
+            gate: None,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Provider for RebuildTestProvider {
+    async fn complete(
+        &self,
+        _messages: &[Message],
+        _tools: &[crate::message::ToolDefinition],
+        _system: &str,
+        _resume_session_id: Option<&str>,
+    ) -> Result<EventStream> {
+        unreachable!("rebuild must use plain text summarization")
+    }
+
+    fn name(&self) -> &str {
+        "rebuild-test"
+    }
+
+    fn fork(&self) -> Arc<dyn Provider> {
+        Arc::new(self.clone())
+    }
+
+    fn context_window(&self) -> usize {
+        1_000
+    }
+
+    async fn complete_simple_with_usage(
+        &self,
+        prompt: &str,
+        _system: &str,
+    ) -> Result<(String, jcode_provider_core::SimpleCompletionUsage)> {
+        self.prompts.lock().unwrap().push(prompt.to_string());
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.unwrap().forget();
+        }
+        anyhow::ensure!(!self.fail, "simulated summary failure");
+        Ok((
+            self.response.into(),
+            jcode_provider_core::SimpleCompletionUsage::default(),
+        ))
+    }
+}
+
+fn rebuild_fixture() -> (CompactionManager, Vec<Message>) {
+    let mut messages: Vec<Message> = (0..16)
+        .map(|i| make_text_message(Role::User, &format!("Original fact {i}")))
+        .collect();
+    messages.extend([
+        make_text_message(Role::User, "Run the check"),
+        Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: "retained-call".into(),
+                name: "bash".into(),
+                input: serde_json::json!({"command":"check"}),
+                thought_signature: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "retained-call".into(),
+                content: "retained result".into(),
+                is_error: None,
+            }],
+            timestamp: None,
+            tool_duration_ms: None,
+        },
+        make_text_message(Role::User, "Continue"),
+    ]);
+    let mut manager = CompactionManager::new();
+    manager.restore_persisted_state_with(
+        &crate::session::StoredCompactionState {
+            summary_text: String::new(),
+            openai_encrypted_content: Some("REJECTED_CIPHERTEXT".into()),
+            covers_up_to_turn: 16,
+            original_turn_count: 16,
+            compacted_count: 16,
+        },
+        &messages,
+    );
+    (manager, messages)
+}
+
+async fn finish_rebuild(manager: &mut CompactionManager, messages: &[Message]) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager.is_compacting() {
+            tokio::task::yield_now().await;
+            manager.check_and_apply_compaction_with(messages);
+        }
+    })
+    .await
+    .expect("rebuild should finish");
+}
+
+#[tokio::test]
+async fn rebuild_compaction_replaces_prefix_with_four_active_messages_and_keeps_appends() {
+    let (mut manager, mut messages) = rebuild_fixture();
+    let before = serde_json::to_value(&messages).unwrap();
+    let provider = RebuildTestProvider::new();
+    let old_state = manager.persisted_state();
+    assert!(
+        manager
+            .force_compact_with(&messages, Arc::new(provider.clone()))
+            .is_err()
+    );
+    manager
+        .rebuild_compaction_with(&messages, Arc::new(provider.clone()))
+        .unwrap();
+    assert_eq!(
+        manager.persisted_state(),
+        old_state,
+        "old state stays usable while rebuilding"
+    );
+    messages.push(make_text_message(Role::User, "Appended while rebuilding"));
+    manager.notify_message_added();
+    finish_rebuild(&mut manager, &messages).await;
+    let rebuilt = manager.persisted_state().unwrap();
+    assert_eq!(rebuilt.compacted_count, 16);
+    assert_eq!(rebuilt.covers_up_to_turn, 16);
+    assert_eq!(rebuilt.openai_encrypted_content, None);
+    assert_eq!(rebuilt.summary_text, provider.response);
+    assert_eq!(serde_json::to_value(&messages[..20]).unwrap(), before);
+    let provider_messages = manager.messages_for_api_with(&messages);
+    assert_eq!(
+        provider_messages.len(),
+        6,
+        "summary plus original suffix and append"
+    );
+    assert_eq!(
+        serde_json::to_value(&provider_messages[1..]).unwrap(),
+        serde_json::to_value(&messages[16..]).unwrap()
+    );
+    let prompts = provider.prompts.lock().unwrap();
+    assert!(
+        prompts
+            .iter()
+            .all(|prompt| !prompt.contains("REJECTED_CIPHERTEXT"))
+    );
+    assert_eq!(manager.take_compaction_event().unwrap().trigger, "rebuild");
+}
+
+#[tokio::test]
+async fn rebuild_compaction_failures_and_refusals_preserve_previous_state() {
+    for (fail, response) in [
+        (true, "unused"),
+        (false, ""),
+        (false, "I cannot assist with this request."),
+    ] {
+        let (mut manager, messages) = rebuild_fixture();
+        let before = manager.persisted_state();
+        let provider = RebuildTestProvider {
+            fail,
+            response,
+            ..RebuildTestProvider::new()
+        };
+        manager
+            .rebuild_compaction_with(&messages, Arc::new(provider))
+            .unwrap();
+        finish_rebuild(&mut manager, &messages).await;
+        assert_eq!(manager.persisted_state(), before);
+        assert!(manager.take_compaction_event().is_none());
+    }
+}
+
+#[tokio::test]
+async fn rebuild_compaction_chunks_visit_full_prefix_and_long_tool_results() {
+    let (mut manager, mut messages) = rebuild_fixture();
+    for (i, message) in messages[..16].iter_mut().enumerate() {
+        message.content = vec![ContentBlock::Text {
+            text: format!("marker-{i}-{}-end-{i}", "中".repeat(500)),
+            cache_control: None,
+        }];
+    }
+    messages[7].content = vec![ContentBlock::ToolResult {
+        tool_use_id: "old-call".into(),
+        content: format!("{}LONG_OUTPUT_END", "result".repeat(500)),
+        is_error: None,
+    }];
+    let provider = RebuildTestProvider::new();
+    manager
+        .rebuild_compaction_with(&messages, Arc::new(provider.clone()))
+        .unwrap();
+    finish_rebuild(&mut manager, &messages).await;
+    let prompts = provider.prompts.lock().unwrap();
+    assert!(prompts.len() > 2);
+    assert!(prompts.iter().all(|prompt| prompt.len() <= 3_000));
+    let supplied: String = prompts
+        .iter()
+        .map(|prompt| {
+            prompt
+                .split_once("## Next original transcript chunk\n")
+                .unwrap()
+                .1
+        })
+        .collect();
+    for i in (0..16).filter(|i| *i != 7) {
+        assert!(supplied.contains(&format!("marker-{i}-")));
+        assert!(supplied.contains(&format!("-end-{i}")));
+    }
+    assert!(
+        supplied.contains("LONG_OUTPUT_END"),
+        "long tool outputs must not be truncated to previews"
+    );
+    assert!(
+        manager
+            .persisted_state()
+            .unwrap()
+            .openai_encrypted_content
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn rebuild_compaction_discards_stale_prefix_or_summary() {
+    for change_summary in [false, true] {
+        let (mut manager, mut messages) = rebuild_fixture();
+        manager
+            .rebuild_compaction_with(&messages, Arc::new(RebuildTestProvider::new()))
+            .unwrap();
+        if change_summary {
+            manager.active_summary.as_mut().unwrap().text = "Newer summary".into();
+        } else {
+            messages[0] = make_text_message(Role::User, "Edited original fact");
+        }
+        let state_after_change = manager.persisted_state();
+        finish_rebuild(&mut manager, &messages).await;
+        assert_eq!(manager.persisted_state(), state_after_change);
+        assert!(manager.take_compaction_event().is_none());
+    }
+}
+
+#[tokio::test]
+async fn rebuild_compaction_cancellation_and_restore_do_not_apply_pending_summary() {
+    let (mut manager, messages) = rebuild_fixture();
+    let old = manager.persisted_state().unwrap();
+    let provider = RebuildTestProvider {
+        gate: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+        ..RebuildTestProvider::new()
+    };
+    manager
+        .rebuild_compaction_with(&messages, Arc::new(provider))
+        .unwrap();
+    manager.pending_task.as_ref().unwrap().abort();
+    finish_rebuild(&mut manager, &messages).await;
+    assert_eq!(manager.persisted_state(), Some(old.clone()));
+    assert!(manager.pending_rebuild.is_none());
+
+    manager
+        .rebuild_compaction_with(&messages, Arc::new(RebuildTestProvider::new()))
+        .unwrap();
+    manager.restore_persisted_state_with(&old, &messages);
+    tokio::task::yield_now().await;
+    manager.check_and_apply_compaction_with(&messages);
+    assert_eq!(manager.persisted_state(), Some(old));
+    assert!(!manager.is_compacting());
+}
+
 struct MockSummaryProvider;
 
 #[async_trait::async_trait]

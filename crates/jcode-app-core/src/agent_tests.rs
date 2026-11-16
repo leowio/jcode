@@ -1282,6 +1282,77 @@ async fn messages_for_provider_applies_manual_compaction_in_native_auto_mode() {
 // ── InterruptSignal tests ────────────────────────────────────────────────
 
 #[tokio::test]
+async fn manual_rebuild_replaces_native_summary_and_persists_history() {
+    let _env_lock = crate::storage::lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(home) => crate::env::set_var("JCODE_HOME", home),
+                None => crate::env::remove_var("JCODE_HOME"),
+            }
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let provider: Arc<dyn Provider> = Arc::new(NativeAutoCompactionProvider);
+    let registry = Registry::new(provider.clone()).await;
+    let mut agent = Agent::new(provider, registry);
+    for i in 0..20 {
+        agent.add_message(
+            Role::User,
+            vec![ContentBlock::Text {
+                text: format!("retained canonical turn {i}"),
+                cache_control: None,
+            }],
+        );
+    }
+    let total = agent.session.messages.len();
+    agent
+        .apply_openai_native_compaction("rejected-native-state".into(), total - 4)
+        .unwrap();
+    let canonical = serde_json::to_value(&agent.session.messages).unwrap();
+    let old_state = agent.session.compaction.clone();
+    agent.provider_session_id = Some("stale-provider-session".into());
+    agent.session.provider_session_id = Some("stale-provider-session".into());
+
+    let (message, success) = agent.request_compaction_rebuild();
+    assert!(success, "{message}");
+    assert_eq!(
+        agent.session.compaction, old_state,
+        "keep the old summary while rebuilding"
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if agent.poll_compaction_completion_event().is_some() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "rebuild did not complete");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let state = agent.session.compaction.as_ref().unwrap();
+    assert!(state.openai_encrypted_content.is_none());
+    assert!(
+        state
+            .summary_text
+            .contains("manual summary from native-auto provider")
+    );
+    assert_eq!(state.compacted_count, total - 4);
+    assert_eq!(
+        serde_json::to_value(&agent.session.messages).unwrap(),
+        canonical
+    );
+    assert!(agent.provider_session_id.is_none());
+    assert!(agent.session.provider_session_id.is_none());
+    let saved = crate::session::Session::load(&agent.session.id).unwrap();
+    assert_eq!(saved.compaction, agent.session.compaction);
+    assert_eq!(serde_json::to_value(saved.messages).unwrap(), canonical);
+}
+
+#[tokio::test]
 async fn interrupt_signal_fire_before_notified_does_not_hang() {
     // Regression test: fire() called BEFORE notified().await must not hang.
     // The old code called notify_waiters() which drops the notification if

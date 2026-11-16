@@ -1569,6 +1569,14 @@ pub(in crate::tui::app) async fn submit_prepared_remote_enter_input(
             return Ok(());
         }
 
+        if trimmed == "/compact --rebuild" {
+            app.push_display_message(DisplayMessage::system(
+                "Requesting a text summary rebuild from retained history...".to_string(),
+            ));
+            remote.rebuild_compaction().await?;
+            return Ok(());
+        }
+
         if trimmed == "/compact" {
             app.push_display_message(DisplayMessage::system(
                 "Requesting compaction...".to_string(),

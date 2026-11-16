@@ -53,6 +53,14 @@ impl Agent {
     }
 
     pub fn request_manual_compaction(&mut self) -> (String, bool) {
+        self.request_compaction(false)
+    }
+
+    pub fn request_compaction_rebuild(&mut self) -> (String, bool) {
+        self.request_compaction(true)
+    }
+
+    fn request_compaction(&mut self, rebuild: bool) -> (String, bool) {
         if !self.provider.supports_compaction() {
             return (
                 "Manual compaction is not available for this provider.".to_string(),
@@ -87,7 +95,19 @@ impl Agent {
                     }
                 );
 
-                match manager.force_compact_with(&messages, provider) {
+                let result = if rebuild {
+                    manager.rebuild_compaction_with(&messages, provider)
+                } else {
+                    manager.force_compact_with(&messages, provider)
+                };
+                match result {
+                    Ok(()) if rebuild => (
+                        format!(
+                            "{status_msg}\n\n📦 **Rebuilding context** — creating a text summary from the retained history.\n\
+                            The current summary and recent messages stay available until the replacement is ready."
+                        ),
+                        true,
+                    ),
                     Ok(()) => (
                         format!(
                             "{}\n\n📦 **Compacting context** (manual) — summarizing older messages in the background to stay within the context window.\n\

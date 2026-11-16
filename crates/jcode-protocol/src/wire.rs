@@ -496,6 +496,11 @@ pub enum Request {
     #[serde(rename = "compact")]
     Compact { id: u64 },
 
+    /// Rebuild a text summary from the retained canonical history. A separate
+    /// request prevents older servers from silently treating this as /compact.
+    #[serde(rename = "rebuild_compaction")]
+    RebuildCompaction { id: u64 },
+
     /// Trigger immediate memory extraction for the current session
     #[serde(rename = "trigger_memory_extraction")]
     TriggerMemoryExtraction { id: u64 },

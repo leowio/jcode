@@ -2292,7 +2292,21 @@ pub(super) async fn handle_client(
             }
 
             Request::Compact { id } => {
-                handle_compact(id, &agent, &client_event_tx);
+                handle_compact(id, false, &agent, &client_event_tx);
+            }
+
+            Request::RebuildCompaction { id } => {
+                if reject_if_agent_busy_for_request(
+                    id,
+                    "rebuild_compaction",
+                    &client_session_id,
+                    client_is_processing,
+                    &agent,
+                    &client_event_tx,
+                ) {
+                    continue;
+                }
+                handle_compact(id, true, &agent, &client_event_tx);
             }
 
             Request::TriggerMemoryExtraction { id } => {

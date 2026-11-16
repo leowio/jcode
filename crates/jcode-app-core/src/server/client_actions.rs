@@ -1195,6 +1195,7 @@ pub(super) async fn handle_resume_all_sessions(
 
 pub(super) fn handle_compact(
     id: u64,
+    rebuild: bool,
     agent: &Arc<Mutex<Agent>>,
     client_event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) {
@@ -1203,7 +1204,11 @@ pub(super) fn handle_compact(
     crate::runtime_activity::spawn(async move {
         let mut agent_guard = agent.lock().await;
         let session_id = agent_guard.session_id().to_string();
-        let (message, success) = agent_guard.request_manual_compaction();
+        let (message, success) = if rebuild {
+            agent_guard.request_compaction_rebuild()
+        } else {
+            agent_guard.request_manual_compaction()
+        };
         drop(agent_guard);
 
         if success {

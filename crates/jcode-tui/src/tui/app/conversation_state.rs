@@ -29,6 +29,7 @@ impl App {
     pub(super) fn format_compaction_strategy_label(trigger: &str) -> &'static str {
         match trigger {
             "manual" => "manual",
+            "rebuild" => "rebuild",
             "proactive" => "proactive",
             "semantic" => "semantic",
             "reactive" => "reactive",
