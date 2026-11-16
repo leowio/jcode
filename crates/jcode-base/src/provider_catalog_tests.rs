@@ -1,6 +1,49 @@
 use super::*;
 
 #[test]
+fn named_gateway_readiness_before_runtime_env_setup() {
+    let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&["JCODE_TEST_ONBOARDING_GATEWAY_KEY"]);
+    crate::env::remove_var("JCODE_TEST_ONBOARDING_GATEWAY_KEY");
+    let mut config: crate::config::Config = serde_json::from_value(serde_json::json!({
+        "providers": {"gateway": {
+            "type": "open-ai-compatible",
+            "base_url": "http://127.0.0.1:2455/v1",
+            "api_key_env": "JCODE_TEST_ONBOARDING_GATEWAY_KEY",
+            "env_file": "nonexistent-onboarding-gateway.env",
+            "requires_api_key": true
+        }}
+    })).unwrap();
+    assert!(!configured_named_provider_available(&config));
+    crate::env::set_var("JCODE_TEST_ONBOARDING_GATEWAY_KEY", "test-key");
+    assert!(configured_named_provider_available(&config));
+    config.providers.get_mut("gateway").unwrap().base_url = "not a URL".into();
+    assert!(!configured_named_provider_available(&config));
+}
+
+#[test]
+fn named_gateway_readiness_from_private_env_file() {
+    let _lock = crate::storage::lock_test_env();
+    let _guard = EnvGuard::save(&["JCODE_HOME", "JCODE_TEST_ONBOARDING_FILE_KEY"]);
+    let temp = tempfile::tempdir().unwrap();
+    crate::env::set_var("JCODE_HOME", temp.path());
+    crate::env::remove_var("JCODE_TEST_ONBOARDING_FILE_KEY");
+    let config_dir = crate::storage::app_config_dir().unwrap();
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(config_dir.join("gateway.env"), "JCODE_TEST_ONBOARDING_FILE_KEY=test-key\n").unwrap();
+    let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+        "providers": {"gateway": {
+            "type": "open-ai-compatible",
+            "base_url": "http://127.0.0.1:2455/v1",
+            "api_key_env": "JCODE_TEST_ONBOARDING_FILE_KEY",
+            "env_file": "gateway.env",
+            "requires_api_key": true
+        }}
+    })).unwrap();
+    assert!(configured_named_provider_available(&config));
+}
+
+#[test]
 fn conifer_static_fallback_preserves_catalog_except_unverified_together_alias() {
     let profile = openai_compatible_profile_by_id("conifer").expect("Conifer profile");
     let models = openai_compatible_profile_static_models(profile);

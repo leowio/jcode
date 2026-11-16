@@ -1277,6 +1277,27 @@ fn active_named_provider_profile_is_configured() -> Option<bool> {
     Some(load_api_key_from_env_or_config(&key_env, &env_file).is_some())
 }
 
+/// Probe named gateway credentials directly from config. Startup auth prewarming
+/// runs before provider initialization installs the selected profile's env vars.
+pub fn configured_named_provider_available(config: &crate::config::Config) -> bool {
+    config.providers.values().any(|profile| {
+        if normalize_api_base(&profile.base_url).is_none() {
+            return false;
+        }
+        if profile.auth == crate::config::NamedProviderAuth::None {
+            return true;
+        }
+        if profile.api_key.as_deref().is_some_and(|key| !key.trim().is_empty()) {
+            return true;
+        }
+        let key_env = profile.api_key_env.as_deref().unwrap_or("OPENROUTER_API_KEY").trim();
+        let env_file = profile.env_file.as_deref().unwrap_or("openrouter.env").trim();
+        is_safe_env_key_name(key_env)
+            && is_safe_env_file_name(env_file)
+            && load_api_key_from_env_or_config(key_env, env_file).is_some()
+    })
+}
+
 pub fn configured_api_key_source(
     key_var: &str,
     file_var: &str,

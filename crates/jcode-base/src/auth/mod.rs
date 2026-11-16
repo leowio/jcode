@@ -916,7 +916,9 @@ fn build_auth_status_uncached(mode: AuthProbeMode) -> (AuthStatus, Vec<(&'static
         }
     });
     record_auth_probe_step(&mut timings, "openai_compatible", || {
-        let configured = crate::provider_catalog::openai_compatible_profiles()
+        let configured = crate::provider_catalog::configured_named_provider_available(
+            crate::config::config(),
+        ) || crate::provider_catalog::openai_compatible_profiles()
             .iter()
             .copied()
             .any(crate::provider_catalog::openai_compatible_profile_is_configured);
