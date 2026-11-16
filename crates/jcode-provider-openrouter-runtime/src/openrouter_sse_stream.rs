@@ -356,14 +356,19 @@ async fn stream_response(
                 );
             }
         };
-        if azure_responses {
-            if let StreamEvent::Error {
+        if (azure_responses || responses_api)
+            && let StreamEvent::Error {
                 message,
                 retry_after_secs,
             } = &event
-            {
-                return Err(azure_response_failure(message, *retry_after_secs));
-            }
+        {
+            return Err(if azure_responses {
+                azure_response_failure(message, *retry_after_secs)
+            } else {
+                responses_stream_failure(message, *retry_after_secs, "OpenAI-compatible Responses")
+            });
+        }
+        if azure_responses {
             if matches!(event, StreamEvent::MessageEnd { .. }) {
                 saw_message_end = true;
             }
@@ -419,6 +424,14 @@ fn retryable_stream_failure(error: &anyhow::Error) -> bool {
 }
 
 fn azure_response_failure(message: &str, retry_after_secs: Option<u64>) -> anyhow::Error {
+    responses_stream_failure(message, retry_after_secs, "Azure OpenAI Responses")
+}
+
+fn responses_stream_failure(
+    message: &str,
+    retry_after_secs: Option<u64>,
+    protocol: &str,
+) -> anyhow::Error {
     let lower = message.to_ascii_lowercase();
     // The shared Responses parser preserves error type/code in the message.
     // Permanent failures must win even if their prose mentions a timeout or
@@ -437,6 +450,9 @@ fn azure_response_failure(message: &str, retry_after_secs: Option<u64>) -> anyho
         "model_not_found",
         "deployment_not_found",
         "tool argument snapshot differs",
+        "unsafe_to_replay",
+        "invalid api key",
+        "invalid x-api-key",
     ]
     .iter()
     .any(|marker| lower.contains(marker));
@@ -460,7 +476,7 @@ fn azure_response_failure(message: &str, retry_after_secs: Option<u64>) -> anyho
     anyhow::Error::new(AzureResponseFailure {
         retryable: !permanent && (transient || retry_after.is_some()),
         source: jcode_provider_core::retry_after::error_with_retry_after(
-            format!("Azure OpenAI Responses stream error: {message}"),
+            format!("{protocol} stream error: {message}"),
             retry_after,
         ),
     })
@@ -513,6 +529,10 @@ fn is_retryable_error(error_str: &str) -> bool {
                 || error_str.contains("internal server error"))
         || error_str.contains("overloaded")
 }
+
+#[cfg(test)]
+#[path = "native_response_retry_tests.rs"]
+mod native_response_retry_tests;
 
 #[cfg(test)]
 mod tests {

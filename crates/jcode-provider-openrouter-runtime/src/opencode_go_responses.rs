@@ -341,15 +341,34 @@ impl ResponsesStream {
                     self.pending.push(StreamEvent::ThinkingEnd);
                     self.thinking = false;
                 }
-                let message = value
-                    .get("error")
-                    .and_then(|error| error.get("message"))
+                let error = value
+                    .get("response")
+                    .and_then(|response| response.get("error"))
+                    .or_else(|| value.get("error"))
+                    .unwrap_or(&value);
+                let message = error
+                    .get("message")
                     .and_then(Value::as_str)
                     .or_else(|| value.get("message").and_then(Value::as_str))
                     .unwrap_or("OpenCode Go Responses API error");
+                let mut message = message.to_string();
+                for key in ["type", "code"] {
+                    if let Some(marker) = error.get(key).and_then(Value::as_str)
+                        && !matches!(marker, "error" | "response.failed" | "response.error")
+                        && !message.to_ascii_lowercase().contains(&marker.to_ascii_lowercase())
+                    {
+                        message = format!("{marker}: {message}");
+                    }
+                }
+                let retry_after_secs = [error, &value]
+                    .into_iter()
+                    .find_map(|source| {
+                        source.get("retry_after").or_else(|| source.get("retry_after_seconds"))
+                            .and_then(Value::as_u64)
+                    });
                 self.pending.push(StreamEvent::Error {
-                    message: message.to_string(),
-                    retry_after_secs: None,
+                    message,
+                    retry_after_secs,
                 });
                 self.ended = true;
             }
@@ -510,6 +529,31 @@ impl Stream for ResponsesStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_error_details_preserve_permanent_codes_and_retry_hints() {
+        for value in [
+            serde_json::json!({"type":"error", "error":{
+                "type":"invalid_request_error", "code":"content_policy_violation",
+                "message":"native upstream response body failed", "retry_after":7
+            }}),
+            serde_json::json!({"type":"response.failed", "response":{"error":{
+                "type":"invalid_request_error", "code":"content_policy_violation",
+                "message":"native upstream response body failed", "retry_after_seconds":7
+            }}}),
+        ] {
+            let mut stream = ResponsesStream::new(futures::stream::empty::<Result<Bytes, reqwest::Error>>());
+            stream.parse_event(&value.to_string());
+            let event = stream.next_event().unwrap();
+            let StreamEvent::Error { message, retry_after_secs } = event else {
+                panic!("expected error event");
+            };
+            assert!(message.contains("invalid_request_error"));
+            assert!(message.contains("content_policy_violation"));
+            assert!(message.contains("native upstream response body failed"));
+            assert_eq!(retry_after_secs, Some(7));
+        }
+    }
     use futures::StreamExt;
 
     #[test]

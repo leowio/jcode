@@ -57,6 +57,9 @@ pub fn is_transient_transport_error(error_str: &str) -> bool {
         // hyper h1: connection closed while a response was still incomplete.
         || lower.contains("incomplete message")
         || lower.contains("request or response body error")
+        // OpenAI-compatible gateways can emit this message in an SSE error
+        // event without the underlying socket error or stream_read_error code.
+        || lower.contains("native upstream response body failed")
         || lower.contains("badrecordmac")
         || lower.contains("bad_record_mac")
         || lower.contains("fatal alert: badrecordmac")
@@ -200,5 +203,18 @@ mod tests {
         ));
         // Also test the identifier in isolation (case-insensitive)
         assert!(is_transient_transport_error("stream_read_error"));
+    }
+
+    #[test]
+    fn native_upstream_response_body_failure_is_transient() {
+        for message in [
+            "native upstream response body failed",
+            "Native upstream response body failed",
+            "upstream_error: native upstream response body failed",
+        ] {
+            assert!(is_transient_transport_error(message), "{message}");
+        }
+        assert!(!is_transient_transport_error("native request rejected"));
+        assert!(!is_transient_transport_error("invalid response body schema"));
     }
 }
