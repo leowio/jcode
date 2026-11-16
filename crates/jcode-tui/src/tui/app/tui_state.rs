@@ -37,7 +37,16 @@ enum WidgetProviderKind {
 
 impl WidgetProviderKind {
     fn from_provider_key(raw: Option<&str>) -> Self {
+        Self::from_provider_key_with_config(raw, crate::config::config())
+    }
+
+    fn from_provider_key_with_config(raw: Option<&str>, config: &crate::config::Config) -> Self {
         match raw.map(|provider| provider.trim().to_ascii_lowercase()) {
+            Some(provider)
+                if config.providers.get(&provider).is_some_and(|profile| profile.requires_api_key == Some(true)) =>
+            {
+                Self::CostBasedApiKey
+            }
             Some(provider) if provider == "openrouter" => Self::OpenRouter,
             Some(provider) if matches!(provider.as_str(), "opencode" | "opencode-go") => {
                 Self::OpenCode
@@ -66,6 +75,36 @@ impl WidgetProviderKind {
 struct WidgetRouteInfo {
     provider: WidgetProviderKind,
     is_remote: bool,
+}
+
+#[cfg(test)]
+mod named_profile_auth_tests {
+    use super::*;
+
+    #[test]
+    fn named_api_profile_does_not_inherit_openai_oauth() {
+        let config: crate::config::Config = serde_json::from_value(serde_json::json!({
+            "providers": {
+                "codex-lb": {
+                    "type": "open-ai-compatible",
+                    "base_url": "http://127.0.0.1:2455/v1",
+                    "requires_api_key": true
+                }
+            }
+        })).unwrap();
+        assert_eq!(
+            WidgetProviderKind::from_provider_key_with_config(Some("codex-lb"), &config),
+            WidgetProviderKind::CostBasedApiKey
+        );
+        assert_eq!(
+            WidgetProviderKind::from_provider_key_with_config(Some("openai"), &config),
+            WidgetProviderKind::OpenAI
+        );
+        assert_eq!(
+            WidgetProviderKind::from_provider_key_with_config(Some("unknown-profile"), &config),
+            WidgetProviderKind::Unknown
+        );
+    }
 }
 
 fn remote_oauth_account_label<'a>(
