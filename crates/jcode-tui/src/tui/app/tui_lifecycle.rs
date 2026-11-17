@@ -70,7 +70,10 @@ mod terminal_retry_tests {
             });
             app.rate_limit_reset = Some(Instant::now());
             match stop {
-                "budget" => assert!(!app.schedule_pending_remote_retry("interrupted")),
+                "budget" => assert!(!app.schedule_pending_remote_retry_with_limit(
+                    "interrupted",
+                    App::AUTO_RETRY_MAX_ATTEMPTS
+                )),
                 "pause" => app.pause_exhausted_auto_resume("Paused".to_string(), "Paused"),
                 "credential" => app.trip_credential_failure_breaker("401 unauthorized"),
                 _ => unreachable!(),
@@ -122,15 +125,14 @@ impl App {
     }
 
     pub(super) fn schedule_pending_remote_retry(&mut self, reason: &str) -> bool {
-        self.schedule_pending_remote_retry_with_budget(
-            reason,
-            Self::AUTO_RETRY_MAX_ATTEMPTS,
-            Self::auto_retry_is_unlimited(),
-        )
+        self.schedule_pending_remote_retry_with_budget(reason, Self::AUTO_RETRY_MAX_ATTEMPTS, true)
     }
 
     pub(super) fn auto_retry_is_unlimited() -> bool {
-        crate::config::Config::load().provider.max_retries == u32::MAX
+        matches!(
+            crate::config::Config::load().provider.max_retries,
+            0 | u32::MAX
+        )
     }
 
     pub(super) fn transient_remote_retry_error(message: &str) -> bool {
@@ -204,18 +206,14 @@ impl App {
     /// failed) we wait regardless of the pending message's `auto_retry` flag
     /// and promote it to auto-retry so the tick-based resume re-sends it.
     ///
-    /// A provider-specific failure (for example DNS for one host) can persist
-    /// while the generic connectivity probe succeeds, so each forced wait
-    /// consumes one attempt from the per-turn retry budget and returns `false`
-    /// once it is spent, unless unlimited retries were configured. Offline
-    /// probe re-waits (`force == false`) do not
-    /// consume attempts because no request was sent.
+    /// A provider-specific failure can persist while the generic connectivity
+    /// probe succeeds. Keep the held turn retryable with a capped delay until
+    /// cancellation. Offline probe re-waits do not count as provider attempts.
     pub(super) fn schedule_pending_remote_network_wait_with_force(
         &mut self,
         reason: &str,
         force: bool,
     ) -> bool {
-        let unlimited = Self::auto_retry_is_unlimited();
         let retry_cap = crate::config::Config::load()
             .provider
             .retry_backoff_cap_secs
@@ -229,14 +227,6 @@ impl App {
             return false;
         };
         if force {
-            if !unlimited && pending.retry_attempts >= Self::AUTO_RETRY_MAX_ATTEMPTS {
-                self.log_recovery_event(
-                    crate::logging::LogLevel::Warn,
-                    "RECOVERY_NETWORK_WAIT_STOPPED",
-                    "retry_budget_exhausted",
-                );
-                return false;
-            }
             pending.retry_attempts = pending.retry_attempts.saturating_add(1);
         }
         if !pending.auto_retry {
@@ -254,11 +244,7 @@ impl App {
 
         let plan = crate::network_retry::wait_plan();
         let backoff_secs = 5 * u64::from(pending.retry_attempts.max(1));
-        let backoff_secs = if unlimited {
-            backoff_secs.min(retry_cap)
-        } else {
-            backoff_secs
-        };
+        let backoff_secs = backoff_secs.min(retry_cap);
         let retry_at = Instant::now() + Duration::from_secs(backoff_secs);
         pending.retry_at = Some(retry_at);
         self.rate_limit_reset = Some(retry_at);

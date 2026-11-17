@@ -22,6 +22,9 @@ pub(in crate::tui::app) fn handle_server_event(
             turn_id,
             latest_turn_id,
         } => {
+            // Do not retire a newer local send still awaiting acceptance.
+            let awaiting_acceptance =
+                app.current_message_id.is_some() && matches!(app.status, ProcessingStatus::Sending);
             if app.remote_turn_fence.bootstrap(
                 session_id,
                 runtime_generation,
@@ -37,11 +40,13 @@ pub(in crate::tui::app) fn handle_server_event(
                     app.deferred_stream_done_identity = None;
                 }
                 if app.remote_turn_fence.active.is_none()
-                    && app.current_message_id.is_none()
+                    && !awaiting_acceptance
                     && app.deferred_stream_done_id.is_none()
                 {
                     let changed = app.is_processing;
                     app.is_processing = false;
+                    app.current_message_id = None;
+                    app.last_stream_activity = None;
                     app.status = ProcessingStatus::Idle;
                     app.processing_started = None;
                     app.remote_resume_activity = None;
@@ -116,7 +121,7 @@ pub(in crate::tui::app) fn handle_server_event(
     if terminal && identity.is_none() && app.remote_turn_fence.scoped() {
         if let ServerEvent::Error { id, message, .. } = &event {
             if app.pending_agent_model_request_id == Some(*id) {
-                return handle_server_event_inner(app, event, remote);
+                return handle_server_event_inner(app, event, remote, false);
             }
             if remote.finish_runtime_command(*id) {
                 app.push_display_message(DisplayMessage::error(message.clone()));
@@ -129,7 +134,7 @@ pub(in crate::tui::app) fn handle_server_event(
                     // Validation/auth failures and synthetic control completions
                     // occur before turn acceptance, so they have no turn scope.
                     let rejected_id = *id;
-                    let redraw = handle_server_event_inner(app, event, remote);
+                    let redraw = handle_server_event_inner(app, event, remote, false);
                     if !app.is_processing && app.current_message_id == Some(rejected_id) {
                         app.current_message_id = None;
                     }
@@ -165,7 +170,7 @@ pub(in crate::tui::app) fn handle_server_event(
         }
         return false;
     }
-    let redraw = handle_server_event_inner(app, event, remote);
+    let redraw = handle_server_event_inner(app, event, remote, identity.is_some());
     if let Some(identity) = identity
         && terminal
     {

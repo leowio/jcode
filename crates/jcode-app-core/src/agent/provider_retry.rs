@@ -19,7 +19,7 @@ pub(super) async fn complete_split(
     resume_session_id: Option<&str>,
 ) -> Result<EventStream> {
     let config = crate::config::config();
-    if config.provider.max_retries != u32::MAX {
+    if !matches!(config.provider.max_retries, 0 | u32::MAX) {
         return provider
             .complete_split(
                 messages,

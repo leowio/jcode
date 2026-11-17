@@ -89,7 +89,7 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
     app.handle_server_event(
         crate::protocol::ServerEvent::Error {
             id: 11,
-            message: "provider failed hard".to_string(),
+            message: "HTTP 503 Service Unavailable".to_string(),
             retry_after_secs: None,
         },
         &mut remote,
@@ -110,78 +110,44 @@ fn test_remote_error_with_retryable_pending_schedules_retry() {
         .expect("retry should surface a connection status message");
     assert_eq!(retry_notice.role, "system");
     assert!(retry_notice.content.contains("Connection lost - retrying"));
-    assert!(
-        retry_notice
-            .content
-            .contains(&format!("attempt 1/{}", App::AUTO_RETRY_MAX_ATTEMPTS))
-    );
-    assert!(retry_notice.content.contains("Remote request failed"));
+    assert!(retry_notice.content.contains("attempt 1, in 2s"));
+    assert!(retry_notice.content.contains("Temporary provider failure"));
 }
 
 #[test]
-fn test_remote_non_retryable_error_gets_short_auto_poke_retry() {
+fn test_remote_non_retryable_error_stops_without_resending() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
-
     app.auto_poke_incomplete_todos = true;
-    app.queued_messages
-        .push("You have 1 incomplete todo. Continue working, or update the todo tool.".to_string());
+    app.last_submitted_input = Some("fix the adapter".to_string());
     app.rate_limit_pending_message = Some(PendingRemoteMessage {
-        content: "You have 1 incomplete todo. Continue working, or update the todo tool."
-            .to_string(),
+        content: "fix the adapter".to_string(),
         images: vec![],
-        is_system: true,
+        is_system: false,
         system_reminder: None,
         auto_retry: true,
         retry_attempts: 0,
         retry_at: None,
     });
     app.is_processing = true;
-    app.status = ProcessingStatus::Streaming;
-
     app.handle_server_event(
         crate::protocol::ServerEvent::Error {
             id: 12,
-            message: "OpenAI API error 400 Bad Request: {\"error\":{\"message\":\"Invalid 'input[0].encrypted_content': string too long. Expected a string with maximum length 10485760, but got a string with length 11237432 instead.\",\"type\":\"invalid_request_error\",\"code\":\"string_above_max_length\"}}".to_string(),
+            message: "OpenAI API error 400 Bad Request: invalid_request_error".to_string(),
             retry_after_secs: None,
         },
         &mut remote,
     );
-
-    assert!(app.auto_poke_incomplete_todos);
-    let pending = app
-        .rate_limit_pending_message
-        .as_ref()
-        .expect("deterministic error should get a short retry budget");
-    assert_eq!(pending.retry_attempts, 1);
-    assert!(app.rate_limit_reset.is_some());
+    assert!(!app.auto_poke_incomplete_todos);
+    assert!(app.rate_limit_pending_message.is_none());
+    assert!(app.rate_limit_reset.is_none());
+    assert_eq!(app.input, "fix the adapter");
     assert!(
-        app.display_messages()
+        !app.display_messages()
             .iter()
-            .any(|m| m.role == "system" && m.content.contains("attempt 1/2"))
-    );
-
-    app.handle_server_event(
-        crate::protocol::ServerEvent::Error {
-            id: 13,
-            message: "OpenAI API error 400 Bad Request: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"string_above_max_length\"}}".to_string(),
-            retry_after_secs: None,
-        },
-        &mut remote,
-    );
-
-    assert!(app.auto_poke_incomplete_todos);
-    let pending = app
-        .rate_limit_pending_message
-        .as_ref()
-        .expect("second deterministic error should still get final retry");
-    assert_eq!(pending.retry_attempts, 2);
-    assert!(
-        app.display_messages()
-            .iter()
-            .any(|m| m.role == "system" && m.content.contains("attempt 2/2"))
+            .any(|m| m.content.contains("retrying (attempt"))
     );
 }
 
@@ -224,7 +190,7 @@ fn test_remote_non_retryable_error_stops_auto_poke_after_short_retry_budget() {
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.role == "system" && m.content.contains("we stopped poking"))
+            .any(|m| m.role == "system" && m.content.contains("provider rejected the request"))
     );
 }
 
@@ -405,7 +371,7 @@ fn test_remote_connectivity_error_without_auto_retry_still_waits_for_network() {
 include!("remote_failover_routes.rs");
 
 #[test]
-fn test_schedule_pending_remote_retry_respects_retry_limit() {
+fn test_explicit_finite_remote_retry_budget_is_preserved() {
     let mut app = create_test_app();
     app.rate_limit_pending_message = Some(PendingRemoteMessage {
         content: "retry me".to_string(),
@@ -417,7 +383,7 @@ fn test_schedule_pending_remote_retry_respects_retry_limit() {
         retry_at: None,
     });
 
-    assert!(!app.schedule_pending_remote_retry("⚠ failed."));
+    assert!(!app.schedule_pending_remote_retry_with_limit("⚠ failed.", 3));
     assert!(app.rate_limit_pending_message.is_none());
     assert!(app.rate_limit_reset.is_none());
     assert!(
@@ -2180,7 +2146,7 @@ fn test_remote_fork_without_prompt_splits_immediately() {
 }
 
 #[test]
-fn test_credential_failure_breaker_trips_after_consecutive_auth_errors() {
+fn test_remote_credential_failure_stops_before_breaker_budget() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
@@ -2211,11 +2177,16 @@ fn test_credential_failure_breaker_trips_after_consecutive_auth_errors() {
             },
             &mut remote,
         );
+        assert!(
+            app.rate_limit_pending_message.is_none(),
+            "credentials must stop recovery on the first rejection"
+        );
+        assert!(!app.auto_poke_incomplete_todos);
     }
 
     assert!(
         app.rate_limit_pending_message.is_none(),
-        "breaker must clear the pending auto-retry"
+        "credential rejection must clear the pending auto-retry"
     );
     assert!(
         !app.auto_poke_incomplete_todos,
@@ -2226,8 +2197,9 @@ fn test_credential_failure_breaker_trips_after_consecutive_auth_errors() {
     assert!(
         app.display_messages()
             .iter()
-            .any(|m| m.role == "error" && m.content.contains("Stopped automatic retries")),
-        "breaker must surface an actionable stop message"
+            .any(|m| m.content.contains("Stopped automatic retries")
+                && m.content.contains("sign in again")),
+        "credential rejection must surface an actionable stop message"
     );
 }
 

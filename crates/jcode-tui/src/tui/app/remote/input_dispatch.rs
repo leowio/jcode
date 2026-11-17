@@ -14,7 +14,7 @@ pub(in crate::tui::app) async fn begin_remote_send(
     is_system: bool,
     system_reminder: Option<String>,
     auto_retry: bool,
-    retry_attempts: u8,
+    retry_attempts: u32,
 ) -> Result<u64> {
     if let Err(error) = app.prepare_cloud_environment(remote).await {
         crate::logging::info(&format!(

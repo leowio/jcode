@@ -128,7 +128,12 @@ fn promote_bedrock_placeholder_default(bedrock: &bedrock::BedrockProvider) {
 /// Build a Bedrock provider whose default is already the newest flagship in its
 /// cached catalog, instead of the stale placeholder.
 pub(crate) fn new_bedrock_provider() -> bedrock::BedrockProvider {
-    let provider = bedrock::BedrockProvider::new();
+    let config = crate::config::config();
+    let provider = bedrock::BedrockProvider::new().with_retry_config(
+        config.provider.max_retries,
+        config.provider.retry_backoff_cap_secs,
+        config.provider.stream_idle_timeout_secs,
+    );
     promote_bedrock_placeholder_default(&provider);
     provider
 }

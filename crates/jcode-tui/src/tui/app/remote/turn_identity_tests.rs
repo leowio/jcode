@@ -489,3 +489,110 @@ fn unscoped_terminal_cannot_idle_scoped_observer() {
     handle_server_event(&mut app, ServerEvent::Done { id: 1 }, &mut remote);
     assert!(app.is_processing);
 }
+
+#[test]
+fn authoritative_terminal_retires_stale_local_request_id() {
+    for failure in [false, true] {
+        let mut app = create_test_app();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut remote = RemoteConnection::dummy();
+        start(&mut app, &mut remote, "runtime", 7);
+        app.current_message_id = Some(999);
+        app.status = ProcessingStatus::Streaming;
+        app.remote_resume_activity = Some(RemoteResumeActivity {
+            session_id: "session".into(),
+            observed_at: Instant::now(),
+            current_tool_name: None,
+        });
+        let terminal = if failure {
+            ServerEvent::Error {
+                id: 42,
+                message: "Failed to send request to OpenAI API: connection reset".into(),
+                retry_after_secs: None,
+            }
+        } else {
+            ServerEvent::Done { id: 42 }
+        };
+        handle_server_event(&mut app, scoped("runtime", 7, terminal), &mut remote);
+
+        assert!(!app.is_processing, "terminal must close the accepted turn");
+        assert!(app.current_message_id.is_none());
+        assert!(app.remote_turn_fence.active.is_none());
+        assert!(app.remote_resume_activity.is_none());
+        if failure {
+            assert!(app.display_messages().iter().any(|message| {
+                message.role == "error" && message.content.contains("connection reset")
+            }));
+        }
+    }
+}
+
+#[test]
+fn idle_server_snapshot_retires_stale_streaming_but_preserves_unaccepted_send() {
+    for awaiting_acceptance in [false, true] {
+        let mut app = create_test_app();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let mut remote = RemoteConnection::dummy();
+        start(&mut app, &mut remote, "runtime", 7);
+        app.current_message_id = Some(999);
+        app.status = if awaiting_acceptance {
+            ProcessingStatus::Sending
+        } else {
+            ProcessingStatus::Streaming
+        };
+        handle_server_event(
+            &mut app,
+            ServerEvent::TurnState {
+                session_id: "session".into(),
+                runtime_generation: "runtime".into(),
+                latest_turn_id: 7,
+                turn_id: None,
+            },
+            &mut remote,
+        );
+        assert_eq!(app.is_processing, awaiting_acceptance);
+        assert_eq!(app.current_message_id.is_some(), awaiting_acceptance);
+    }
+}
+
+#[test]
+fn scoped_completion_keeps_a_new_local_send_awaiting_acceptance() {
+    let mut app = create_test_app();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let _guard = runtime.enter();
+    let mut remote = RemoteConnection::dummy();
+    start(&mut app, &mut remote, "runtime", 7);
+    app.current_message_id = Some(999);
+    app.status = ProcessingStatus::Sending;
+    app.last_submitted_input = Some("new local request".into());
+
+    handle_server_event(
+        &mut app,
+        scoped("runtime", 7, ServerEvent::Done { id: 42 }),
+        &mut remote,
+    );
+    assert!(app.is_processing);
+    assert!(matches!(app.status, ProcessingStatus::Sending));
+    assert_eq!(app.current_message_id, Some(999));
+    assert_eq!(
+        app.last_submitted_input.as_deref(),
+        Some("new local request")
+    );
+    assert!(app.remote_turn_fence.active.is_none());
+
+    // Its own preacceptance failure can now settle it without reviving turn 7.
+    handle_server_event(
+        &mut app,
+        ServerEvent::Error {
+            id: 999,
+            message: "Already processing a message".into(),
+            retry_after_secs: None,
+        },
+        &mut remote,
+    );
+    assert!(!app.is_processing);
+    assert!(app.current_message_id.is_none());
+    assert_eq!(app.input, "new local request");
+}

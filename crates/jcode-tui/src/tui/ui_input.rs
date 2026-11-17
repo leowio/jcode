@@ -561,7 +561,7 @@ fn connection_phase_label(phase: &ConnectionPhase) -> String {
         ConnectionPhase::SendingRequest => "sending context".to_string(),
         ConnectionPhase::WaitingForResponse => "waiting for response".to_string(),
         ConnectionPhase::Streaming => "streaming".to_string(),
-        ConnectionPhase::Retrying { attempt, max } if *max == u32::MAX => {
+        ConnectionPhase::Retrying { attempt, max } if matches!(*max, 0 | u32::MAX) => {
             format!("retrying {attempt}")
         }
         ConnectionPhase::Retrying { attempt, max } => format!("retrying {}/{}", attempt, max),
@@ -570,13 +570,12 @@ fn connection_phase_label(phase: &ConnectionPhase) -> String {
 
 #[test]
 fn unlimited_connection_retry_label_omits_numeric_maximum() {
-    assert_eq!(
-        connection_phase_label(&ConnectionPhase::Retrying {
-            attempt: 12,
-            max: u32::MAX,
-        }),
-        "retrying 12"
-    );
+    for max in [0, u32::MAX] {
+        assert_eq!(
+            connection_phase_label(&ConnectionPhase::Retrying { attempt: 12, max }),
+            "retrying 12"
+        );
+    }
 }
 
 fn display_connection_type(connection_type: &str) -> String {

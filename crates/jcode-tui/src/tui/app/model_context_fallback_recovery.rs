@@ -203,22 +203,8 @@ impl App {
         };
 
         let config = crate::config::Config::load().provider;
-        if remote_resend
-            .as_ref()
-            .is_some_and(|payload| payload.retry_attempts >= Self::AUTO_RETRY_MAX_ATTEMPTS)
-            && config.cross_provider_failover == crate::config::CrossProviderFailoverMode::Countdown
-        {
-            self.automatic_failover_stopped = true;
-            if let Some(payload) = remote_resend {
-                self.restore_failover_payload(payload);
-            }
-            self.push_display_message(DisplayMessage::system(format!(
-                "Stopped automatic failover after {} retries. Use /model to choose a working account and resend manually.",
-                Self::AUTO_RETRY_MAX_ATTEMPTS
-            )));
-            self.set_status_notice("Paused: automatic failover retry limit reached");
-            return;
-        }
+        // Transport retries do not consume the separate route-switch budget.
+        // The target history below still prevents repeated or excessive switches.
         match config.cross_provider_failover {
             crate::config::CrossProviderFailoverMode::Manual => {
                 if let Some(payload) = remote_resend {
@@ -241,7 +227,7 @@ impl App {
                 };
                 if self.automatic_failover_targets.contains(target)
                     || self.automatic_failover_targets.len()
-                        >= usize::from(Self::AUTO_RETRY_MAX_ATTEMPTS)
+                        >= Self::AUTO_RETRY_MAX_ATTEMPTS as usize
                 {
                     self.automatic_failover_stopped = true;
                     if let Some(payload) = remote_resend {

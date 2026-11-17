@@ -178,7 +178,7 @@ impl App {
     pub(in super::super) fn schedule_pending_remote_retry_with_limit(
         &mut self,
         reason: &str,
-        max_attempts: u8,
+        max_attempts: u32,
     ) -> bool {
         // Explicit budgets remain bounded for deterministic failures and failover.
         self.schedule_pending_remote_retry_with_budget(reason, max_attempts, false)
@@ -187,7 +187,7 @@ impl App {
     pub(in super::super) fn schedule_pending_remote_retry_with_budget(
         &mut self,
         reason: &str,
-        max_attempts: u8,
+        max_attempts: u32,
         unlimited: bool,
     ) -> bool {
         let retry_cap = crate::config::Config::load()

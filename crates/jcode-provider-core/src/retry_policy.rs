@@ -1,7 +1,11 @@
-//! A request budget shared by provider transports. `u32::MAX` is an explicit
-//! unlimited setting, not a very large finite range that eventually overflows.
+//! Request budgets shared by provider transports. Zero retries transient failures
+//! until cancellation; `u32::MAX` remains an unlimited compatibility alias.
 
+use anyhow::Result;
+use jcode_message_types::StreamEvent;
+use std::future::Future;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RetryPolicy {
@@ -12,7 +16,7 @@ pub struct RetryPolicy {
 impl RetryPolicy {
     pub fn new(max_attempts: u32, backoff_cap: Duration) -> Self {
         Self {
-            max_attempts: max_attempts.max(1),
+            max_attempts,
             backoff_cap: backoff_cap.max(Duration::from_millis(1)),
         }
     }
@@ -22,7 +26,7 @@ impl RetryPolicy {
     }
 
     pub fn is_unlimited(self) -> bool {
-        self.max_attempts == u32::MAX
+        matches!(self.max_attempts, 0 | u32::MAX)
     }
 
     pub fn allows_retry_after(self, attempt: u32) -> bool {
@@ -50,6 +54,18 @@ impl RetryPolicy {
         server_hint.unwrap_or_else(|| {
             crate::attempt_tracker::retry_backoff_delay(attempt, base_ms).min(self.backoff_cap)
         })
+    }
+}
+
+/// Cancel an in-flight provider attempt or backoff when its consumer goes away.
+pub async fn while_consumer_open<T>(
+    tx: &mpsc::Sender<Result<StreamEvent>>,
+    future: impl Future<Output = T>,
+) -> Option<T> {
+    tokio::select! {
+        biased;
+        _ = tx.closed() => None,
+        result = future => Some(result),
     }
 }
 
@@ -82,7 +98,29 @@ mod tests {
         assert!(policy.allows_retry_after(1));
         assert!(!policy.allows_retry_after(2));
         assert!(!policy.allows_retry_after(u32::MAX));
-        assert_eq!(RetryPolicy::new(0, Duration::ZERO).attempts().count(), 1);
+    }
+
+    #[test]
+    fn zero_budget_is_unlimited_and_keeps_legacy_alias() {
+        for limit in [0, u32::MAX] {
+            let policy = RetryPolicy::new(limit, Duration::from_secs(30));
+            assert!(policy.is_unlimited());
+            assert_eq!(policy.attempts().take(1000).last(), Some(999));
+            assert!(policy.allows_retry_after(u32::MAX));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_pending_attempt_without_waiting_for_timeout() {
+        let (tx, rx) = mpsc::channel(1);
+        let wait = while_consumer_open(&tx, std::future::pending::<()>());
+        drop(rx);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

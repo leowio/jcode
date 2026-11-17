@@ -49,6 +49,44 @@ use tokio_stream::wrappers::ReceiverStream;
 const DEFAULT_MODEL: &str = "anthropic.claude-opus-5-5";
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 4096;
 
+#[cfg(any(feature = "aws-sdk", test))]
+fn retryable_bedrock_failure(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    if [
+        "accessdenied",
+        "access denied",
+        "validationexception",
+        "resourcenotfound",
+        "unrecognizedclient",
+        "invalidsignature",
+        "expiredtoken",
+        "unsupported",
+        "notimplemented",
+    ]
+    .iter()
+    .any(|kind| lower.contains(kind))
+    {
+        return false;
+    }
+    [
+        "throttl",
+        "toomanyrequests",
+        "too many requests",
+        "rate exceeded",
+        "serviceunavailable",
+        "service unavailable",
+        "internalserver",
+        "internal server",
+        "modeltimeout",
+        "modelnotready",
+        "modelstreamerror",
+        "requesttimeout",
+    ]
+    .iter()
+    .any(|kind| lower.contains(kind))
+        || jcode_provider_core::is_transient_transport_error(&lower)
+}
+
 #[cfg(feature = "aws-sdk")]
 fn bedrock_token_usage(usage: &aws_sdk_bedrockruntime::types::TokenUsage) -> StreamEvent {
     // Bedrock input is disjoint from the cache counters. Leave normalization
@@ -95,7 +133,16 @@ struct PersistedCatalog {
     fetched_at_rfc3339: String,
 }
 
+#[derive(Clone, Copy)]
+#[cfg_attr(not(feature = "aws-sdk"), allow(dead_code))]
+struct BedrockRetryConfig {
+    max_attempts: u32,
+    backoff_cap_secs: u64,
+    idle_timeout_secs: u64,
+}
+
 pub struct BedrockProvider {
+    retry_config: Option<BedrockRetryConfig>,
     model: Arc<RwLock<String>>,
     effort: Arc<RwLock<Option<String>>>,
     fetched_models: Arc<RwLock<Vec<String>>>,
@@ -150,6 +197,7 @@ impl BedrockProvider {
         let model =
             std::env::var("JCODE_BEDROCK_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         let provider = Self {
+            retry_config: None,
             model: Arc::new(RwLock::new(model)),
             effort: Arc::new(RwLock::new(Self::env_or_config("JCODE_BEDROCK_EFFORT"))),
             fetched_models: Arc::new(RwLock::new(Vec::new())),
@@ -160,6 +208,42 @@ impl BedrockProvider {
         };
         provider.seed_cached_catalog();
         provider
+    }
+
+    /// Apply the composition root's resolved provider settings. Standalone
+    /// consumers may omit this and use the shared environment overrides.
+    pub fn with_retry_config(
+        mut self,
+        max_attempts: u32,
+        backoff_cap_secs: u64,
+        idle_timeout_secs: u64,
+    ) -> Self {
+        self.retry_config = Some(BedrockRetryConfig {
+            max_attempts,
+            backoff_cap_secs: backoff_cap_secs.max(1),
+            idle_timeout_secs: idle_timeout_secs.max(1),
+        });
+        self
+    }
+
+    #[cfg(feature = "aws-sdk")]
+    fn effective_retry_config(&self) -> BedrockRetryConfig {
+        self.retry_config.unwrap_or_else(|| BedrockRetryConfig {
+            max_attempts: std::env::var("JCODE_MAX_RETRIES")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0),
+            backoff_cap_secs: std::env::var("JCODE_RETRY_BACKOFF_CAP_SECS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(30)
+                .max(1),
+            idle_timeout_secs: std::env::var("JCODE_STREAM_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(180)
+                .max(1),
+        })
     }
 
     pub fn has_credentials() -> bool {
@@ -1240,105 +1324,211 @@ impl Provider for BedrockProvider {
                 ),
             ],
         );
+        let retry_config = self.effective_retry_config();
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(64);
         tokio::spawn(async move {
-            let mut req = client
-                .converse_stream()
-                .model_id(model.clone())
-                .set_additional_model_request_fields(additional_fields)
-                .set_messages(Some(request_messages));
-            if let Some(system_blocks) = system_blocks {
-                req = req.set_system(Some(system_blocks));
-            }
-            if let Some(tool_config) = tool_config {
-                req = req.tool_config(tool_config);
-            }
-            if let Some(inference_config) = inference_config {
-                req = req.inference_config(inference_config);
-            }
-            let resp = match req.send().await {
-                Ok(resp) => resp,
-                Err(err) => {
-                    let _ = tx
-                        .send(Err(anyhow::anyhow!(Self::classify_error_message(
-                            &Self::sdk_error_message(&err)
-                        ))))
-                        .await;
-                    return;
+            let monitor = tx.clone();
+            let _ = jcode_provider_core::retry_policy::while_consumer_open(&monitor, async move {
+                let policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+                    retry_config.max_attempts,
+                    std::time::Duration::from_secs(retry_config.backoff_cap_secs),
+                );
+                let idle_timeout = std::time::Duration::from_secs(retry_config.idle_timeout_secs);
+                let mut next_delay = None;
+                let mut req = client
+                    .converse_stream()
+                    .model_id(model.clone())
+                    .set_additional_model_request_fields(additional_fields)
+                    .set_messages(Some(request_messages));
+                if let Some(system_blocks) = system_blocks {
+                    req = req.set_system(Some(system_blocks));
                 }
-            };
-            let mut stream = resp.stream;
-            let mut current_tool: Option<(String, String, String)> = None;
-            loop {
-                match stream.recv().await {
-                    Ok(Some(event)) => match event {
-                        ConverseStreamOutput::ContentBlockStart(start) => {
-                            if let Some(ContentBlockStart::ToolUse(tool)) = start.start {
-                                let id = tool.tool_use_id().to_string();
-                                let name = tool.name().to_string();
-                                current_tool = Some((id.clone(), name.clone(), String::new()));
-                                let _ = tx.send(Ok(StreamEvent::ToolUseStart { id, name })).await;
+                if let Some(tool_config) = tool_config {
+                    req = req.tool_config(tool_config);
+                }
+                if let Some(inference_config) = inference_config {
+                    req = req.inference_config(inference_config);
+                }
+                'attempts: for attempt in policy.attempts() {
+                    if let Some(delay) = next_delay.take() {
+                        tokio::time::sleep(delay).await;
+                    }
+                    let resp = match tokio::time::timeout(idle_timeout, req.clone().send()).await {
+                        Ok(Ok(resp)) => resp,
+                        Ok(Err(error)) => {
+                            let raw = Self::sdk_error_message(&error);
+                            if retryable_bedrock_failure(&raw) && policy.allows_retry_after(attempt) {
+                                let retry_after = error
+                                    .raw_response()
+                                    .and_then(|response| response.headers().get("retry-after"))
+                                    .and_then(|value| value.parse::<u64>().ok())
+                                    .map(|seconds| {
+                                        let hint = jcode_provider_core::retry_after::RetryAfter::from_delay(
+                                            std::time::Duration::from_secs(seconds),
+                                        );
+                                        if policy.is_unlimited() {
+                                            hint.remaining_unbounded()
+                                        } else {
+                                            hint.remaining()
+                                        }
+                                    });
+                                next_delay = Some(policy.delay(
+                                    attempt.saturating_add(1),
+                                    retry_after,
+                                    1000,
+                                ));
+                                jcode_logging::warn(&format!(
+                                    "Bedrock transient request failure, retrying: {raw}"
+                                ));
+                                continue;
                             }
+                            let _ = tx
+                                .send(Err(anyhow::anyhow!(Self::classify_error_message(&raw))))
+                                .await;
+                            return;
                         }
-                        ConverseStreamOutput::ContentBlockDelta(delta) => {
-                            if let Some(d) = delta.delta {
-                                match d {
-                                    ContentBlockDelta::Text(text) => {
-                                        let _ = tx.send(Ok(StreamEvent::TextDelta(text))).await;
+                        Err(_) => {
+                            if policy.allows_retry_after(attempt) {
+                                next_delay =
+                                    Some(policy.delay(attempt.saturating_add(1), None, 1000));
+                                continue;
+                            }
+                            let _ = tx
+                                .send(Err(anyhow::anyhow!(
+                                    "Bedrock request timed out waiting for response"
+                                )))
+                                .await;
+                            return;
+                        }
+                    };
+                    let mut saw_output = false;
+                    let mut completed = false;
+                    let mut stream = resp.stream;
+                    let mut current_tool: Option<(String, String, String)> = None;
+                    loop {
+                        let event = match tokio::time::timeout(idle_timeout, stream.recv()).await {
+                            Ok(event) => event,
+                            Err(_) if !saw_output && policy.allows_retry_after(attempt) => {
+                                next_delay =
+                                    Some(policy.delay(attempt.saturating_add(1), None, 1000));
+                                continue 'attempts;
+                            }
+                            Err(_) if completed => return,
+                            Err(_) => {
+                                let _ = tx
+                                    .send(Err(anyhow::anyhow!(
+                                        "Bedrock stream timed out waiting for data"
+                                    )))
+                                    .await;
+                                return;
+                            }
+                        };
+                        match event {
+                            Ok(Some(event)) => match event {
+                                ConverseStreamOutput::ContentBlockStart(start) => {
+                                    if let Some(ContentBlockStart::ToolUse(tool)) = start.start {
+                                        saw_output = true;
+                                        let id = tool.tool_use_id().to_string();
+                                        let name = tool.name().to_string();
+                                        current_tool =
+                                            Some((id.clone(), name.clone(), String::new()));
+                                        let _ = tx
+                                            .send(Ok(StreamEvent::ToolUseStart { id, name }))
+                                            .await;
                                     }
-                                    ContentBlockDelta::ToolUse(tool_delta) => {
-                                        let input = tool_delta.input();
-                                        if !input.is_empty() {
-                                            if let Some((_, _, buf)) = current_tool.as_mut() {
-                                                buf.push_str(input);
+                                }
+                                ConverseStreamOutput::ContentBlockDelta(delta) => {
+                                    if let Some(d) = delta.delta {
+                                        match d {
+                                            ContentBlockDelta::Text(text) => {
+                                                saw_output = true;
+                                                let _ =
+                                                    tx.send(Ok(StreamEvent::TextDelta(text))).await;
                                             }
-                                            let _ = tx
-                                                .send(Ok(StreamEvent::ToolInputDelta(
-                                                    input.to_string(),
-                                                )))
-                                                .await;
+                                            ContentBlockDelta::ToolUse(tool_delta) => {
+                                                let input = tool_delta.input();
+                                                if !input.is_empty() {
+                                                    saw_output = true;
+                                                    if let Some((_, _, buf)) = current_tool.as_mut()
+                                                    {
+                                                        buf.push_str(input);
+                                                    }
+                                                    let _ = tx
+                                                        .send(Ok(StreamEvent::ToolInputDelta(
+                                                            input.to_string(),
+                                                        )))
+                                                        .await;
+                                                }
+                                            }
+                                            ContentBlockDelta::ReasoningContent(
+                                                ReasoningContentBlockDelta::Text(text),
+                                            ) => {
+                                                saw_output = true;
+                                                let _ = tx
+                                                    .send(Ok(StreamEvent::ThinkingDelta(text)))
+                                                    .await;
+                                            }
+                                            _ => {}
                                         }
                                     }
-                                    ContentBlockDelta::ReasoningContent(
-                                        ReasoningContentBlockDelta::Text(text),
-                                    ) => {
-                                        let _ = tx.send(Ok(StreamEvent::ThinkingDelta(text))).await;
-                                    }
-                                    _ => {}
                                 }
+                                ConverseStreamOutput::ContentBlockStop(_) => {
+                                    if current_tool.take().is_some() {
+                                        let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
+                                    }
+                                }
+                                ConverseStreamOutput::MessageStop(stop) => {
+                                    saw_output = true;
+                                    completed = true;
+                                    let reason = Some(format!("{:?}", stop.stop_reason()));
+                                    let _ = tx
+                                        .send(Ok(StreamEvent::MessageEnd {
+                                            stop_reason: reason,
+                                        }))
+                                        .await;
+                                }
+                                ConverseStreamOutput::Metadata(meta) => {
+                                    if let Some(usage) = meta.usage() {
+                                        let _ = tx.send(Ok(bedrock_token_usage(usage))).await;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Ok(None) if !saw_output && policy.allows_retry_after(attempt) => {
+                                next_delay =
+                                    Some(policy.delay(attempt.saturating_add(1), None, 1000));
+                                continue 'attempts;
+                            }
+                            Ok(None) if completed => return,
+                            Ok(None) => {
+                                let _ = tx.send(Err(anyhow::anyhow!(
+                                    "Bedrock stream disconnected before completion"
+                                ))).await;
+                                return;
+                            }
+                            Err(_) if completed => return,
+                            Err(err) => {
+                                let raw = Self::sdk_error_message(&err);
+                                if !saw_output
+                                    && retryable_bedrock_failure(&raw)
+                                    && policy.allows_retry_after(attempt)
+                                {
+                                    next_delay =
+                                        Some(policy.delay(attempt.saturating_add(1), None, 1000));
+                                    continue 'attempts;
+                                }
+                                let _ = tx
+                                    .send(Err(anyhow::anyhow!(Self::classify_error_message(
+                                        &Self::sdk_error_message(&err)
+                                    ))))
+                                    .await;
+                                return;
                             }
                         }
-                        ConverseStreamOutput::ContentBlockStop(_) => {
-                            if current_tool.take().is_some() {
-                                let _ = tx.send(Ok(StreamEvent::ToolUseEnd)).await;
-                            }
-                        }
-                        ConverseStreamOutput::MessageStop(stop) => {
-                            let reason = Some(format!("{:?}", stop.stop_reason()));
-                            let _ = tx
-                                .send(Ok(StreamEvent::MessageEnd {
-                                    stop_reason: reason,
-                                }))
-                                .await;
-                        }
-                        ConverseStreamOutput::Metadata(meta) => {
-                            if let Some(usage) = meta.usage() {
-                                let _ = tx.send(Ok(bedrock_token_usage(usage))).await;
-                            }
-                        }
-                        _ => {}
-                    },
-                    Ok(None) => break,
-                    Err(err) => {
-                        let _ = tx
-                            .send(Err(anyhow::anyhow!(Self::classify_error_message(
-                                &Self::sdk_error_message(&err)
-                            ))))
-                            .await;
-                        break;
                     }
                 }
-            }
+            })
+            .await;
         });
         Ok(Box::pin(ReceiverStream::new(rx))
             as Pin<
@@ -1530,6 +1720,7 @@ impl Provider for BedrockProvider {
 
     fn fork(&self) -> Arc<dyn Provider> {
         Arc::new(Self {
+            retry_config: self.retry_config,
             model: Arc::new(RwLock::new(self.model())),
             effort: Arc::new(RwLock::new(
                 self.effort

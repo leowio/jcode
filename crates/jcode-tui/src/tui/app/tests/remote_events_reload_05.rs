@@ -216,7 +216,7 @@ fn test_disconnect_still_clears_pending_for_non_queued_shapes() {
         is_system: false,
         system_reminder: None,
         auto_retry: true,
-        retry_attempts: u8::MAX,
+        retry_attempts: u32::MAX,
         retry_at: None,
     });
 

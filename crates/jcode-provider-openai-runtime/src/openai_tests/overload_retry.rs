@@ -41,11 +41,19 @@ async fn overload_public_retry_case(recover: bool, partial: bool, large_input: b
                     }
                 }
             }
-            if data.starts_with(b"GET /v1/models ") {
+            // Catalog refreshes and endpoint reachability reads are not response attempts.
+            if data.starts_with(b"GET /v1/models ") || data.starts_with(b"GET / HTTP/") {
                 tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
                 continue;
             }
-            assert!(data.starts_with(b"POST /v1/responses "));
+            assert!(
+                data.starts_with(b"POST /v1/responses "),
+                "unexpected fixture request: {}",
+                String::from_utf8_lossy(&data)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+            );
             let end = data.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let request: serde_json::Value = serde_json::from_slice(&data[end..]).unwrap();
             assert!(

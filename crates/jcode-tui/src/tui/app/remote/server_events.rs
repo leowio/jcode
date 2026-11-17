@@ -20,6 +20,115 @@ fn allow_runtime_identity_mismatch() -> bool {
     std::env::var_os("JCODE_ALLOW_SERVER_VERSION_MISMATCH").is_some()
 }
 
+fn provider_http_status(message: &str) -> Option<u16> {
+    static STATUS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?i)(?:\b(?:api\s+error|http(?:\s+status)?|status(?:\s+code)?)\b[\s:=()]*)(\d{3})\b|\b(\d{3})\s+(?:bad request|unauthorized|forbidden|payment required|not found|request timeout|too many requests|internal server error|bad gateway|service unavailable|gateway timeout)\b",
+        )
+        .expect("provider status expression")
+    });
+    let captures = STATUS.captures(message)?;
+    captures
+        .get(1)
+        .or_else(|| captures.get(2))?
+        .as_str()
+        .parse()
+        .ok()
+}
+
+fn permanent_provider_http_failure(message: &str) -> bool {
+    matches!(
+        provider_http_status(message),
+        Some(400 | 401 | 402 | 403 | 404 | 405 | 413 | 415 | 422)
+    )
+}
+
+fn unsafe_turn_replay(app: &App, message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "do not retry",
+        "not safe to retry",
+        "unsafe to replay",
+        "unsafe_to_replay",
+        "no safe replay",
+        "cannot safely replay",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+    {
+        return true;
+    }
+
+    // Cursor's native agent may execute tools before emitting any text. A
+    // fresh whole-turn resend is only safe when the error proves that this
+    // transport failed before dispatch, rather than during the agent run.
+    let provider = app
+        .remote_provider_name
+        .as_deref()
+        .unwrap_or_else(|| app.provider.name());
+    let cursor = provider.eq_ignore_ascii_case("cursor")
+        || provider.eq_ignore_ascii_case("cursor-cli")
+        || lower.contains("cursor agent");
+    cursor
+        && ![
+            "failed to connect to ",
+            "timed out connecting to ",
+            "tls handshake with cursor agent host failed",
+            "timed out during tls handshake with cursor agent host",
+            "http/2 handshake with cursor agent host failed",
+            "timed out during http/2 handshake with cursor agent host",
+            "http/2 connection not ready",
+            "timed out waiting for http/2 connection readiness",
+        ]
+        .iter()
+        .any(|marker| lower.starts_with(marker))
+}
+
+fn retryable_provider_failure(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    if crate::provider::parse_failover_prompt_message(message).is_some()
+        || crate::auth::refresh_state::error_is_permanent_rejection(message)
+        || jcode_provider_core::is_definitive_usage_exhaustion(message)
+        || [
+            "invalid api key",
+            "invalid_api_key",
+            "invalid x-api-key",
+            "authentication_error",
+            "invalid_request_error",
+            "invalid_function_parameters",
+            "context_length_exceeded",
+            "interrupted by user",
+            "cancelled",
+            "canceled",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        return false;
+    }
+    if let Some(status) = provider_http_status(message) {
+        return matches!(status, 408 | 429 | 500 | 502 | 503 | 504 | 529)
+            || (status == 507
+                && message
+                    .to_ascii_lowercase()
+                    .contains("exceeded request buffer limit while retrying upstream"));
+    }
+    // An explicit HTTP status describes the failure; incidental words such
+    // as "billing service temporarily unavailable" in a 503 body do not
+    // turn it into a permanent account rejection.
+    if App::permanent_remote_retry_error(message) {
+        return false;
+    }
+    if lower.contains("server_is_overloaded")
+        || lower.contains("overloaded_error")
+        || lower.contains("service_unavailable_error")
+        || lower.contains("exceeded request buffer limit while retrying upstream")
+    {
+        return true;
+    }
+    App::transient_remote_retry_error(message)
+}
+
 /// Parse a jcode version string into an orderable `(major, minor, patch)`, but
 /// only for *clean release* builds.
 ///
@@ -125,6 +234,7 @@ fn handle_server_event_inner(
     app: &mut App,
     event: ServerEvent,
     remote: &mut impl RemoteEventState,
+    authoritative_turn: bool,
 ) -> bool {
     // Pure presence/catalog/telemetry traffic must not defeat a 30-minute idle
     // period. Every other event may mutate the transcript or start active work.
@@ -196,9 +306,10 @@ fn handle_server_event_inner(
         return true;
     }
 
-    // Request-scoped terminals cannot settle a different locally owned turn.
-    // Resumed observer turns have no request ID and retain legacy settlement.
+    // A scoped terminal has already passed the runtime/turn fence. A stale
+    // local request ID cannot veto it, except for a newer send awaiting acceptance.
     if let ServerEvent::Done { id } | ServerEvent::Error { id, .. } = &event
+        && (!authoritative_turn || matches!(app.status, ProcessingStatus::Sending))
         && app.current_message_id.is_some_and(|current| current != *id)
         && app.pending_agent_model_request_id != Some(*id)
     {
@@ -949,7 +1060,7 @@ fn handle_server_event_inner(
                 );
             let completes_resumed_turn =
                 app.current_message_id.is_none() && app.is_processing && has_resumed_turn_evidence;
-            if app.current_message_id == Some(id) || completes_resumed_turn {
+            if authoritative_turn || app.current_message_id == Some(id) || completes_resumed_turn {
                 // Block mode has no animation to finish. Reveal the final partial
                 // paragraph now rather than waiting for its timeout after Done.
                 if app.stream_buffer.block_streaming_enabled() {
@@ -1112,6 +1223,7 @@ fn handle_server_event_inner(
                 return false;
             }
             app.refresh_openai_usage_after_quota_error(&message);
+            let unsafe_replay = unsafe_turn_replay(app, &message);
             // The server rejects a Message request with this error while its
             // previous turn is still running. This typically happens when a
             // reload/reconnect raced the turn-end dispatch: the history
@@ -1167,10 +1279,14 @@ fn handle_server_event_inner(
             let is_permanent_refresh_rejection =
                 crate::auth::refresh_state::error_is_permanent_rejection(&message);
             let unlimited_retries = App::auto_retry_is_unlimited();
-            let permanent_retry_error = App::permanent_remote_retry_error(&message);
+            let permanent_retry_error = App::permanent_remote_retry_error(&message)
+                && !retryable_provider_failure(&message);
+            let permanent_http_failure = permanent_provider_http_failure(&message);
             let reset_duration = if is_failover_prompt
                 || is_permanent_refresh_rejection
-                || (unlimited_retries && permanent_retry_error)
+                || permanent_http_failure
+                || unsafe_replay
+                || permanent_retry_error
             {
                 None
             } else {
@@ -1193,18 +1309,16 @@ fn handle_server_event_inner(
                         })
                     })
                     .or_else(|| parse_rate_limit_error(&message))
-                    .filter(|duration| Instant::now().checked_add(*duration).is_some())
+                    .map(|duration| {
+                        if Instant::now().checked_add(duration).is_some() {
+                            duration
+                        } else {
+                            duration.min(Duration::from_secs(MAX_TURN_HOLD_SECS))
+                        }
+                    })
             };
-            // Rate-limit holds share the per-turn budget unless unlimited
-            // transient retries were explicitly configured.
-            let rate_limit_retry_exhausted = !unlimited_retries
-                && reset_duration.is_some()
-                && app
-                    .rate_limit_pending_message
-                    .as_ref()
-                    .is_some_and(|pending| pending.retry_attempts >= App::AUTO_RETRY_MAX_ATTEMPTS);
+            // Classified rate limits remain held until cancellation or recovery.
             if let Some(reset_duration) = reset_duration
-                && !rate_limit_retry_exhausted
                 && let Some(is_system) = app.rate_limit_pending_message.as_mut().map(|pending| {
                     pending.retry_attempts = pending.retry_attempts.saturating_add(1);
                     pending.is_system
@@ -1255,6 +1369,9 @@ fn handle_server_event_inner(
                 });
             }
             app.is_processing = false;
+            app.current_message_id = None;
+            app.processing_started = None;
+            app.remote_resume_activity = None;
             app.note_turn_failed(App::compact_provider_failure(&message));
             app.status = ProcessingStatus::Idle;
             app.stream_message_ended = false;
@@ -1271,11 +1388,44 @@ fn handle_server_event_inner(
             }
             remote.clear_pending();
             remote.reset_call_output_tokens_seen();
+            if unsafe_replay {
+                app.pause_exhausted_auto_resume(
+                    "Stopped automatic retries: the previous operation may already have taken effect. Reconcile its existing result before resending.".to_string(),
+                    "Stopped: replay outcome needs reconciliation",
+                );
+                return false;
+            }
+            // Deterministic model/endpoint-capability failures (e.g. Volcengine
+            // Ark's coding-plan endpoint returning 404 UnsupportedModel, or a
+            // model-not-found) can never succeed by resending the identical
+            // request. Fail fast with an actionable hint instead of burning the
+            // auto-retry budget on guaranteed 4xx responses (#387).
+            if crate::tui::app::commands::is_fatal_model_endpoint_error(&message) {
+                app.clear_pending_remote_retry();
+                if app.auto_poke_incomplete_todos {
+                    crate::tui::app::commands::stop_auto_poke_for_non_retryable_error(
+                        app, &message,
+                    );
+                }
+                app.push_display_message(DisplayMessage::system(
+                    "🛑 Not retrying: the model is not valid for the configured endpoint (e.g. an Ark coding-plan endpoint rejecting a model without the coding plan feature, or a model-not-found). Check the model name and base URL (the coding endpoint `/api/coding/v3` only accepts coding-plan models; use `/api/v3` otherwise), then send again.".to_string(),
+                ));
+                app.set_status_notice("Stopped: model/endpoint mismatch");
+                app.restore_failed_input_to_box();
+                // Switching models is exactly the right fix for a
+                // model/endpoint mismatch: offer the next best route.
+                app.offer_fallback_after_error_with_payload(
+                    &message,
+                    failed_fallback_payload.clone(),
+                );
+                return false;
+            }
             // Account quota exhaustion (e.g. OpenAI `usage_limit_reached`):
             // the error line above is the whole explanation. Offer the next
             // pool account as one line and skip retry/poke chatter, since
             // resending to the spent account can never succeed.
             if !is_failover_prompt
+                && !retryable_provider_failure(&message)
                 && jcode_provider_core::classify_failover_error_message(&message)
                     .should_mark_provider_unavailable()
                 && !crate::tui::app::commands::is_auto_poke_connectivity_error(&message)
@@ -1303,19 +1453,6 @@ fn handle_server_event_inner(
                 app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return false;
             }
-            if rate_limit_retry_exhausted {
-                // Do not fall through to the generic retry or turn-end
-                // auto-poke: either would immediately restart the loop.
-                app.pause_exhausted_auto_resume(
-                    format!(
-                        "Rate-limit retry limit reached after {} automatic resumes. The provider still reports a limit. Your message is back in the input box. Wait for the limit to reset, check the provider account, or switch with /model.",
-                        App::AUTO_RETRY_MAX_ATTEMPTS
-                    ),
-                    "Paused: provider limit did not clear",
-                );
-                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
-                return false;
-            }
             // A refresh token explicitly rejected or revoked by the provider
             // cannot recover by resending. Stop on the first such error, even
             // with auto-poke off, rather than spending the generic retry budget
@@ -1329,7 +1466,17 @@ fn handle_server_event_inner(
                 app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return false;
             }
-            if unlimited_retries && permanent_retry_error {
+            if permanent_http_failure
+                && !crate::tui::app::commands::is_fatal_model_endpoint_error(&message)
+            {
+                app.pause_exhausted_auto_resume(
+                    "Stopped automatic retries: the provider rejected the request or credentials. Fix the request or sign in again, then send again.".to_string(),
+                    "Stopped: provider request needs attention",
+                );
+                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
+                return false;
+            }
+            if permanent_retry_error {
                 app.pause_exhausted_auto_resume(
                     "Stopped automatic retries: this request needs a change to its credentials, quota, model, or content before it can succeed. Your message is back in the input box.".to_string(),
                     "Stopped: request needs attention",
@@ -1337,25 +1484,26 @@ fn handle_server_event_inner(
                 app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
                 return false;
             }
-            // Stream-idle failures follow an accepted request. The provider
-            // owns transport retries and fallback already. A network probe
-            // cannot fix these and must not restart that entire retry budget.
+            // A terminal stream timeout ended the failed server turn. Resume
+            // from persisted tool receipts, after the unsafe-replay guard above.
             let lower_message = message.to_ascii_lowercase();
             let is_stream_idle_timeout = lower_message
                 .contains("stream read timeout: no data received")
                 || lower_message.contains("timed out waiting for next websocket activity")
                 || lower_message.contains("did not complete within");
-            if is_stream_idle_timeout && !unlimited_retries {
-                app.pause_exhausted_auto_resume(
-                    "Stopped automatic retries: the provider stream stalled after the request was accepted. Your message is back in the input box. Retry manually, reduce the conversation with /compact, or choose another route with /model.".to_string(),
-                    "Paused: provider stream stopped responding",
-                );
-                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
-                return false;
+            if is_stream_idle_timeout && !permanent_http_failure {
+                if let Some(pending) = app.rate_limit_pending_message.as_mut() {
+                    pending.auto_retry = true;
+                }
+                if app.schedule_pending_remote_retry("⚠ Provider stream stalled.") {
+                    app.note_turn_retrying(App::compact_provider_failure(&message));
+                    return false;
+                }
             }
             // Connection-establishment failures can recover when the network
             // returns. Keep these separate from accepted but stalled streams.
-            let is_connectivity_error = !is_stream_idle_timeout
+            let is_connectivity_error = !permanent_http_failure
+                && !is_stream_idle_timeout
                 && (crate::tui::app::commands::is_auto_poke_connectivity_error(&message)
                     || crate::network_retry::classify_message(&message).is_some());
             if is_connectivity_error
@@ -1363,20 +1511,14 @@ fn handle_server_event_inner(
             {
                 return false;
             }
-            if is_connectivity_error && app.rate_limit_pending_message.is_some() {
-                // The generic connectivity probe can succeed while this
-                // provider's host stays unreachable (for example a DNS
-                // failure for one endpoint). The budget is spent: pause
-                // instead of resending, and keep auto-poke from restarting it.
-                app.pause_exhausted_auto_resume(
-                    format!(
-                        "Connection retry limit reached after {} automatic resumes. Your message is back in the input box. Check the provider endpoint or DNS, then re-send or switch with /model.",
-                        App::AUTO_RETRY_MAX_ATTEMPTS
-                    ),
-                    "Paused: provider connection did not recover",
-                );
-                app.offer_fallback_after_error_with_payload(&message, failed_fallback_payload);
-                return false;
+            if retryable_provider_failure(&message) {
+                if let Some(pending) = app.rate_limit_pending_message.as_mut() {
+                    pending.auto_retry = true;
+                }
+                if app.schedule_pending_remote_retry("⚠ Temporary provider failure.") {
+                    app.note_turn_retrying(App::compact_provider_failure(&message));
+                    return false;
+                }
             }
             // Credential-failure circuit breaker: repeated auth failures mean
             // the login/API key is dead. Resending the identical request can
@@ -1385,31 +1527,6 @@ fn handle_server_event_inner(
             // automatic resend path and tell the user to /login or /model.
             if !is_connectivity_error && app.note_error_for_credential_breaker(&message) {
                 app.trip_credential_failure_breaker(&message);
-                app.offer_fallback_after_error_with_payload(
-                    &message,
-                    failed_fallback_payload.clone(),
-                );
-                return false;
-            }
-            // Deterministic model/endpoint-capability failures (e.g. Volcengine
-            // Ark's coding-plan endpoint returning 404 UnsupportedModel, or a
-            // model-not-found) can never succeed by resending the identical
-            // request. Fail fast with an actionable hint instead of burning the
-            // auto-retry budget on guaranteed 4xx responses (#387).
-            if crate::tui::app::commands::is_fatal_model_endpoint_error(&message) {
-                app.clear_pending_remote_retry();
-                if app.auto_poke_incomplete_todos {
-                    crate::tui::app::commands::stop_auto_poke_for_non_retryable_error(
-                        app, &message,
-                    );
-                }
-                app.push_display_message(DisplayMessage::system(
-                    "🛑 Not retrying: the model is not valid for the configured endpoint (e.g. an Ark coding-plan endpoint rejecting a model without the coding plan feature, or a model-not-found). Check the model name and base URL (the coding endpoint `/api/coding/v3` only accepts coding-plan models; use `/api/v3` otherwise), then send again.".to_string(),
-                ));
-                app.set_status_notice("Stopped: model/endpoint mismatch");
-                app.restore_failed_input_to_box();
-                // Switching models is exactly the right fix for a
-                // model/endpoint mismatch: offer the next best route.
                 app.offer_fallback_after_error_with_payload(
                     &message,
                     failed_fallback_payload.clone(),
@@ -1442,8 +1559,8 @@ fn handle_server_event_inner(
                 );
                 return false;
             }
-            if unlimited_retries {
-                if !App::transient_remote_retry_error(&message) {
+            {
+                if !retryable_provider_failure(&message) && !is_stream_idle_timeout {
                     app.pause_exhausted_auto_resume(
                         "Stopped automatic retries: the provider did not report a transient failure. Your message is back in the input box.".to_string(),
                         "Stopped: request needs attention",

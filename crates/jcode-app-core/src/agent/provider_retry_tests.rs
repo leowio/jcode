@@ -95,7 +95,49 @@ fn start(provider: Arc<dyn Provider>, policy: RetryPolicy) -> EventStream {
 }
 
 fn unlimited() -> RetryPolicy {
-    RetryPolicy::new(u32::MAX, Duration::from_millis(1))
+    RetryPolicy::new(0, Duration::from_millis(1))
+}
+
+#[tokio::test]
+async fn provider_retry_zero_setting_enables_generic_runtime_recovery() {
+    let _env_lock = crate::storage::lock_test_env();
+    struct Restore(Option<std::ffi::OsString>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(value) => crate::env::set_var("JCODE_MAX_RETRIES", value),
+                None => crate::env::remove_var("JCODE_MAX_RETRIES"),
+            }
+            crate::config::invalidate_config_cache();
+        }
+    }
+    let _restore = Restore(std::env::var_os("JCODE_MAX_RETRIES"));
+    crate::env::set_var("JCODE_MAX_RETRIES", "0");
+    crate::config::invalidate_config_cache();
+    let provider = Arc::new(MockProvider::new(vec![
+        Step::InitialError("503 service unavailable"),
+        Step::Stream(vec![Ok(StreamEvent::TextDelta("recovered".into()))]),
+    ]));
+    let stream = complete_split(
+        provider.clone(),
+        &[Message::user("request")],
+        &[],
+        "",
+        "",
+        None,
+    )
+    .await
+    .unwrap();
+    let events = tokio::time::timeout(Duration::from_secs(5), stream.collect::<Vec<_>>())
+        .await
+        .expect("zero budget must recover rather than propagate the first failure");
+    assert_eq!(provider.attempts.load(Ordering::SeqCst), 2);
+    assert!(events.iter().all(Result::is_ok));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Ok(StreamEvent::TextDelta(text)) if text == "recovered"))
+    );
 }
 
 #[tokio::test]

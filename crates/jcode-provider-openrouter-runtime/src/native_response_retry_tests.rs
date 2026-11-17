@@ -17,7 +17,7 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
     let server = std::thread::spawn(move || {
         let mut requests = 0;
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        'requests: while !server_stop.load(Ordering::SeqCst) && Instant::now() < deadline {
             let (mut socket, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -26,7 +26,9 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
                 }
                 Err(error) => panic!("accept: {error}"),
             };
-            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
             let mut request = Vec::new();
             loop {
                 let mut bytes = [0; 4096];
@@ -35,10 +37,17 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
                 request.extend_from_slice(&bytes[..count]);
                 if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
                     let headers = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                    if headers.starts_with("get / http/") {
+                        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                        continue 'requests;
+                    }
                     assert!(headers.starts_with("post /v1/responses "), "{headers}");
-                    let length: usize = headers.lines()
+                    let length: usize = headers
+                        .lines()
                         .find_map(|line| line.strip_prefix("content-length: "))
-                        .unwrap().parse().unwrap();
+                        .unwrap()
+                        .parse()
+                        .unwrap();
                     if request.len() >= end + 4 + length {
                         break;
                     }
@@ -46,12 +55,15 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
             }
             requests += 1;
             let body = if requests == 1 {
-                format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\ndata: {error}\n\n")
+                format!(
+                    "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\ndata: {error}\n\n"
+                )
             } else {
                 concat!(
                     "data: {\"type\":\"response.output_text.delta\",\"delta\":\"final\"}\n\n",
                     "data: {\"type\":\"response.completed\",\"response\":{}}\n\n",
-                ).to_string()
+                )
+                .to_string()
             };
             write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             if requests == 2 {
@@ -60,14 +72,26 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
         }
         requests
     });
-    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
     let result = runtime.block_on(async {
         let (tx, mut rx) = mpsc::channel(64);
         let task = tokio::spawn(run_stream_with_retries(
-            reqwest::Client::new(), base, ProviderAuth::None { label: "test".into() },
-            false, "native-body-retry-test".into(),
+            reqwest::Client::new(),
+            base,
+            ProviderAuth::None {
+                label: "test".into(),
+            },
+            false,
+            "native-body-retry-test".into(),
             serde_json::json!({"model":"test", "input":[], "stream":true}),
-            false, tx, Arc::new(Mutex::new(None)), "test".into(), true,
+            false,
+            tx,
+            Arc::new(Mutex::new(None)),
+            "test".into(),
+            true,
         ));
         let result = tokio::time::timeout(Duration::from_secs(8), async {
             let mut events = Vec::new();
@@ -75,7 +99,8 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
                 events.push(event);
             }
             events
-        }).await;
+        })
+        .await;
         task.abort();
         result
     });
@@ -87,21 +112,53 @@ fn run_native_payload(error: Value) -> (Vec<Result<StreamEvent>>, usize) {
 #[test]
 fn native_response_body_failure_retries_and_rolls_back_partial_output() {
     let (events, requests) = run_native_failure("native upstream response body failed");
-    assert_eq!(requests, 2, "native SSE errors must enter the provider retry loop");
+    assert_eq!(
+        requests, 2,
+        "native SSE errors must enter the provider retry loop"
+    );
     let events: Vec<_> = events.into_iter().map(Result::unwrap).collect();
-    let rollback = events.iter().position(|event| matches!(event, StreamEvent::RetryRollback { .. })).unwrap();
-    assert!(events[..rollback].iter().any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "partial")));
-    assert!(events[rollback + 1..].iter().any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "final")));
-    assert!(!events.iter().any(|event| matches!(event, StreamEvent::Error { .. })));
-    assert_eq!(events.iter().filter(|event| matches!(event, StreamEvent::MessageEnd { .. })).count(), 1);
+    let rollback = events
+        .iter()
+        .position(|event| matches!(event, StreamEvent::RetryRollback { .. }))
+        .unwrap();
+    assert!(
+        events[..rollback]
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "partial"))
+    );
+    assert!(
+        events[rollback + 1..]
+            .iter()
+            .any(|event| matches!(event, StreamEvent::TextDelta(text) if text == "final"))
+    );
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, StreamEvent::Error { .. }))
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StreamEvent::MessageEnd { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]
 fn native_response_body_wording_does_not_override_permanent_or_unsafe_failure() {
-    for prefix in ["invalid_request_error", "invalid API key", "unsafe_to_replay"] {
-        let (events, requests) = run_native_failure(&format!("{prefix}: native upstream response body failed"));
+    for prefix in [
+        "invalid_request_error",
+        "invalid API key",
+        "unsafe_to_replay",
+    ] {
+        let (events, requests) =
+            run_native_failure(&format!("{prefix}: native upstream response body failed"));
         assert_eq!(requests, 1, "{prefix} must not retry");
-        let error = events.into_iter().find_map(Result::err).expect("surface permanent error");
+        let error = events
+            .into_iter()
+            .find_map(Result::err)
+            .expect("surface permanent error");
         assert!(error.to_string().contains(prefix));
     }
     for error in [

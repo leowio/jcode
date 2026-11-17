@@ -44,7 +44,7 @@ fn recovery_log_snapshot_correlates_state_without_payloads() {
     assert!(fallback.contains(&("pending", "false".into())));
 }
 
-fn held_retry_message(attempts: u8, auto_retry: bool) -> PendingRemoteMessage {
+fn held_retry_message(attempts: u32, auto_retry: bool) -> PendingRemoteMessage {
     PendingRemoteMessage {
         content: "finish the interrupted task [image 1]".into(),
         images: vec![("image/png".into(), "aW1hZ2U=".into())],
@@ -120,7 +120,7 @@ fn held_retry_failed_write_rearms_bounded_retry_and_retains_payload() {
 }
 
 #[test]
-fn held_retry_failed_write_at_limit_restores_draft_and_images() {
+fn held_retry_failed_write_past_old_limit_preserves_payload_and_rearms() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let mut app = create_test_app();
@@ -135,16 +135,16 @@ fn held_retry_failed_write_at_limit_restores_draft_and_images() {
     app.rate_limit_reset = Some(Instant::now() - Duration::from_secs(1));
     assert!(rt.block_on(remote::dispatch_due_remote_retry(&mut app, &mut connection)));
     assert!(!app.is_processing);
-    assert!(app.rate_limit_reset.is_none());
-    assert!(app.rate_limit_pending_message.is_none());
-    assert_eq!(app.input, original.content);
-    assert_eq!(app.pending_images, original.images);
-    assert!(!app.auto_poke_incomplete_todos);
-    assert!(
-        app.display_messages()
-            .iter()
-            .any(|message| message.content.contains("Automatic retry limit reached"))
-    );
+    let pending = app
+        .rate_limit_pending_message
+        .as_ref()
+        .expect("failed write remains held");
+    assert!(app.rate_limit_reset.is_some());
+    assert_eq!(pending.content, original.content);
+    assert_eq!(pending.images, original.images);
+    assert_eq!(pending.retry_attempts, original.retry_attempts + 1);
+    assert!(pending.auto_retry);
+    assert!(app.auto_poke_incomplete_todos);
 }
 
 #[test]
