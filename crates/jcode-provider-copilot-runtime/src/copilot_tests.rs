@@ -848,3 +848,29 @@ fn sonnet5_effort_fallback_without_catalog() {
     assert!(provider.set_reasoning_effort("high").is_err());
     assert_eq!(provider.reasoning_effort(), None);
 }
+
+#[test]
+fn consumer_cancellation_interrupts_pending_initialization() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let provider = make_test_provider(Vec::new());
+        provider
+            .init_done
+            .store(false, std::sync::atomic::Ordering::Release);
+        let (tx, rx) = mpsc::channel(1);
+        let task = tokio::spawn(async move {
+            provider
+                .stream_request(serde_json::json!({}), false, true, tx)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        drop(rx);
+        tokio::time::timeout(std::time::Duration::from_millis(300), task)
+            .await
+            .unwrap()
+            .unwrap();
+    });
+}

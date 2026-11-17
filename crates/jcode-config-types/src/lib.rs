@@ -1294,7 +1294,8 @@ pub struct ProviderConfig {
     /// Default: 180. Overridable via `JCODE_STREAM_IDLE_TIMEOUT_SECS`.
     pub stream_idle_timeout_secs: u64,
     /// Maximum request attempts for transient provider errors, including the
-    /// initial attempt. Default: 8. Overridable via `JCODE_MAX_RETRIES`.
+    /// initial attempt. Zero (the default) retries until cancelled.
+    /// Overridable via `JCODE_MAX_RETRIES`.
     pub max_retries: u32,
     /// Maximum exponential-backoff delay between transient-error retries.
     /// Default: 30 seconds. Overridable via `JCODE_RETRY_BACKOFF_CAP_SECS`.
@@ -1332,7 +1333,7 @@ impl Default for ProviderConfig {
             gemini_project: None,
             model_picker_providers: None,
             stream_idle_timeout_secs: 180,
-            max_retries: 8,
+            max_retries: 0,
             retry_backoff_cap_secs: 30,
             request_compression: "auto".to_string(),
         }

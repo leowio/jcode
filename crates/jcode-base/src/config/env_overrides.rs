@@ -916,7 +916,6 @@ impl Config {
         }
         if let Ok(v) = std::env::var("JCODE_MAX_RETRIES")
             && let Ok(parsed) = v.trim().parse::<u32>()
-            && parsed > 0
         {
             self.provider.max_retries = parsed;
         }

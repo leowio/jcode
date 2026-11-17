@@ -176,6 +176,9 @@ pub fn project_memory_file(project_dir: &std::path::Path) -> Result<PathBuf> {
     let mut hasher = DefaultHasher::new();
     project_dir.hash(&mut hasher);
     let project_hash = format!("{:016x}", hasher.finish());
+    if let Some(shared) = storage::shared_project_dir(project_dir)? {
+        return Ok(shared.join("memory.json"));
+    }
     let memory_dir = storage::jcode_dir()?.join("memory").join("projects");
     Ok(memory_dir.join(format!("{}.json", project_hash)))
 }
@@ -267,6 +270,11 @@ impl MemoryManager {
         };
 
         project_memory_file(&project_dir).map(Some)
+    }
+
+    fn project_transaction(&self) -> Result<Option<storage::ProjectDataLock>> {
+        if self.test_mode { return Ok(None); }
+        storage::shared_project_transaction(self.project_dir.as_deref(), "memory")
     }
 
     fn legacy_notes_path(&self) -> Result<Option<PathBuf>> {
@@ -372,6 +380,7 @@ impl MemoryManager {
     }
 
     pub fn save_project(&self, store: &MemoryStore) -> Result<()> {
+        let _project_transaction = self.project_transaction()?;
         if let Some(path) = self.project_memory_path()? {
             storage::write_json(&path, store)?;
         }
@@ -386,6 +395,7 @@ impl MemoryManager {
     /// Store without embedding inference. Exact duplicates reinforce an existing
     /// entry only within the requested scope, never mutate a different project.
     pub fn remember_project(&self, entry: MemoryEntry) -> Result<String> {
+        let _project_transaction = self.project_transaction()?;
         anyhow::ensure!(
             self.project_memory_path()?.is_some(),
             "Project memory requires a working directory; use global scope explicitly"
@@ -425,6 +435,7 @@ impl MemoryManager {
     /// Preserves existing inbound/outbound graph relationships while refreshing
     /// content and tags.
     pub fn upsert_project_memory(&self, entry: MemoryEntry) -> Result<String> {
+        let _project_transaction = self.project_transaction()?;
         let mut graph = self.load_project_graph()?;
         let id = self.upsert_memory_in_graph(&mut graph, entry);
         self.save_project_graph(&graph)?;
@@ -809,6 +820,7 @@ impl MemoryManager {
 
     /// Ensure all memories have embeddings (backfill for existing memories)
     pub fn backfill_embeddings(&self) -> Result<(usize, usize)> {
+        let _project_transaction = self.project_transaction()?;
         let mut generated = 0;
         let mut failed = 0;
 
@@ -940,6 +952,7 @@ impl MemoryManager {
     }
 
     pub fn forget(&self, id: &str) -> Result<bool> {
+        let _project_transaction = self.project_transaction()?;
         // Try graph-based removal first (new format)
         let mut project_graph = self.load_project_graph()?;
         if project_graph.remove_memory(id).is_some() {
@@ -1224,11 +1237,13 @@ impl MemoryManager {
 
     /// Load the existing project graph without generating embeddings.
     pub fn load_project_graph(&self) -> Result<MemoryGraph> {
+        let _project_transaction = self.project_transaction()?;
         let Some(path) = self.project_memory_path()? else {
             return Ok(MemoryGraph::new());
         };
 
         if !self.test_mode
+            && _project_transaction.is_none()
             && let Some(mut graph) = cached_graph(&path)
         {
             if Self::normalize_graph_search_text(&mut graph) {
@@ -1344,6 +1359,7 @@ impl MemoryManager {
 
     /// Save project memories as a MemoryGraph
     pub fn save_project_graph(&self, graph: &MemoryGraph) -> Result<()> {
+        let _project_transaction = self.project_transaction()?;
         if let Some(path) = self.project_memory_path()? {
             storage::write_json(&path, graph)?;
             if !self.test_mode {
@@ -1365,6 +1381,7 @@ impl MemoryManager {
 
     /// Add a tag to a memory
     pub fn tag_memory(&self, memory_id: &str, tag: &str) -> Result<()> {
+        let _project_transaction = self.project_transaction()?;
         // Try project first
         let mut graph = self.load_project_graph()?;
         if graph.memories.contains_key(memory_id) {
@@ -1384,6 +1401,7 @@ impl MemoryManager {
 
     /// Link two memories with a RelatesTo edge
     pub fn link_memories(&self, from_id: &str, to_id: &str, weight: f32) -> Result<()> {
+        let _project_transaction = self.project_transaction()?;
         // Try project first
         let mut graph = self.load_project_graph()?;
         if graph.memories.contains_key(from_id) && graph.memories.contains_key(to_id) {
@@ -1570,3 +1588,7 @@ impl Default for MemoryManager {
 #[cfg(test)]
 #[path = "memory_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "shared_project_tests.rs"]
+mod shared_project_tests;

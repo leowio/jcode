@@ -1136,6 +1136,11 @@ async fn refresh_openai_tokens_at(
         let Some(label) = label else {
             return refresh_openai_tokens_inner(&token_url, timeout, &observed_refresh, None).await;
         };
+        // Serialize the whole rotating-token transaction across JCODE_HOMEs.
+        // Reload happens only after this lock, so a waiter reuses the winner's
+        // persisted token instead of submitting the consumed refresh grant.
+        #[cfg(unix)]
+        let _refresh_lock = crate::auth::codex::lock_openai_refresh().await?;
         crate::auth::refresh_coordinator::single_flight(
             format!("openai:{label}"),
             {
@@ -1476,3 +1481,7 @@ async fn refresh_tokens_at_url(token_url: &str, refresh_token: &str) -> Result<O
 #[cfg(test)]
 #[path = "oauth_tests/mod.rs"]
 mod tests;
+
+#[cfg(all(test, unix))]
+#[path = "shared_openai_auth_tests.rs"]
+mod shared_openai_auth_tests;

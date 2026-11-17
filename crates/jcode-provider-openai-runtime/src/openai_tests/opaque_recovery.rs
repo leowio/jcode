@@ -8,12 +8,26 @@ async fn opaque_recovery_public_case(
     http_failure: bool,
     cancel: bool,
 ) {
+    opaque_recovery_retry_case(persistent, prefix, specific, http_failure, cancel, 0).await;
+}
+
+async fn opaque_recovery_retry_case(
+    persistent: bool,
+    prefix: Option<Value>,
+    specific: bool,
+    http_failure: bool,
+    cancel: bool,
+    transient_failures: usize,
+) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let _env_lock = jcode_base::storage::lock_test_env();
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
+    let _attempts = EnvVarGuard::set("JCODE_MAX_RETRIES", "0");
+    let _cap = EnvVarGuard::set("JCODE_RETRY_BACKOFF_CAP_SECS", "1");
+    jcode_base::config::invalidate_config_cache();
     let should_recover = prefix.is_none() && !specific;
     let (http_seen_tx, http_seen_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(async move {
@@ -42,74 +56,90 @@ async fn opaque_recovery_public_case(
             }
         }
         if should_recover {
-            let (mut tcp, mut data) = loop {
-                let (mut tcp, _) = listener.accept().await.unwrap();
-                let mut data = Vec::new();
-                while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+            let mut retry_index = 0;
+            loop {
+                let (mut tcp, mut data) = loop {
+                    let (mut tcp, _) = listener.accept().await.unwrap();
+                    let mut data = Vec::new();
+                    while !data.windows(4).any(|w| w == b"\r\n\r\n") {
+                        let mut buf = [0; 4096];
+                        let n = tcp.read(&mut buf).await.unwrap();
+                        assert_ne!(n, 0);
+                        data.extend_from_slice(&buf[..n]);
+                    }
+                    if data.starts_with(b"GET /v1/models ") {
+                        tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
+                        continue;
+                    }
+                    break (tcp, data);
+                };
+                let (header_end, length) = loop {
+                    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&data[..pos]);
+                        assert!(headers.starts_with("POST /v1/responses "), "{headers}");
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|s| s.parse::<usize>().ok())
+                            })
+                            .unwrap();
+                        break (pos + 4, length);
+                    }
+                };
+                while data.len() < header_end + length {
                     let mut buf = [0; 4096];
                     let n = tcp.read(&mut buf).await.unwrap();
                     assert_ne!(n, 0);
                     data.extend_from_slice(&buf[..n]);
                 }
-                if data.starts_with(b"GET /v1/models ") {
-                    tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
+                let http: Value =
+                    serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
+                assert!(http.get("previous_response_id").is_none());
+                assert_eq!(http["instructions"], wire["instructions"]);
+                assert_eq!(http["tools"], wire["tools"]);
+                assert!(!http["tools"].as_array().unwrap().is_empty());
+                assert_eq!(http["reasoning"], wire["reasoning"]);
+                let serialized = http["input"].to_string();
+                assert!(serialized.contains("encrypted-history"));
+                assert!(serialized.contains("retained tool output"));
+                if !persistent {
+                    let mut expected = wire.clone();
+                    expected.as_object_mut().unwrap().remove("type");
+                    // The WS framing and SSE transport flags are the only wire differences.
+                    expected["stream"] = Value::Bool(true);
+                    assert_eq!(http, expected);
+                }
+                if retry_index < transient_failures {
+                    let partial = retry_index + 1 == transient_failures;
+                    if partial {
+                        let body = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"discard me\"}\n\ndata: {\"type\":\"error\",\"error\":{\"type\":\"server_error\",\"message\":\"server temporarily overloaded\"}}\n\n";
+                        tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    } else {
+                        let body = r#"{"error":{"message":"server temporarily overloaded"}}"#;
+                        tcp.write_all(format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    }
+                    retry_index += 1;
                     continue;
                 }
-                break (tcp, data);
-            };
-            let (header_end, length) = loop {
-                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&data[..pos]);
-                    assert!(headers.starts_with("POST /v1/responses "), "{headers}");
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.to_lowercase()
-                                .strip_prefix("content-length: ")
-                                .and_then(|s| s.parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    break (pos + 4, length);
-                }
-            };
-            while data.len() < header_end + length {
-                let mut buf = [0; 4096];
-                let n = tcp.read(&mut buf).await.unwrap();
-                assert_ne!(n, 0);
-                data.extend_from_slice(&buf[..n]);
-            }
-            let http: Value =
-                serde_json::from_slice(&data[header_end..header_end + length]).unwrap();
-            assert!(http.get("previous_response_id").is_none());
-            assert_eq!(http["instructions"], wire["instructions"]);
-            assert_eq!(http["tools"], wire["tools"]);
-            assert!(!http["tools"].as_array().unwrap().is_empty());
-            assert_eq!(http["reasoning"], wire["reasoning"]);
-            let serialized = http["input"].to_string();
-            assert!(serialized.contains("encrypted-history"));
-            assert!(serialized.contains("retained tool output"));
-            if !persistent {
-                let mut expected = wire.clone();
-                expected.as_object_mut().unwrap().remove("type");
-                // The WS framing and SSE transport flags are the only wire differences.
-                expected["stream"] = Value::Bool(true);
-                assert_eq!(http, expected);
-            }
-            let _ = http_seen_tx.send(http);
-            if cancel {
-                let mut buf = [0; 1];
-                assert_eq!(
-                    tcp.read(&mut buf).await.unwrap(),
-                    0,
-                    "cancelled HTTP socket remained open"
-                );
-            } else {
-                let body: String = if http_failure {
-                    "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Distinct HTTPS rejection\"}}\n\n".into()
+                let _ = http_seen_tx.send(http);
+                if cancel {
+                    let mut buf = [0; 1];
+                    assert_eq!(
+                        tcp.read(&mut buf).await.unwrap(),
+                        0,
+                        "cancelled HTTP socket remained open"
+                    );
                 } else {
-                    "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_recovered\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_recovered\",\"status\":\"completed\",\"output\":[]}}\n\n".into()
-                };
-                tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                    let body: String = if http_failure {
+                        "data: {\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Distinct HTTPS rejection\"}}\n\n".into()
+                    } else {
+                        "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_recovered\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"recovered\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_recovered\",\"status\":\"completed\",\"output\":[]}}\n\n".into()
+                    };
+                    tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                }
+                break;
             }
         }
         assert!(tokio::time::timeout(Duration::from_millis(150), async {
@@ -203,6 +233,7 @@ async fn opaque_recovery_public_case(
                 match event.unwrap() {
                     StreamEvent::Error { message, .. } => errors.push(message),
                     StreamEvent::TextDelta(delta) => text.push_str(&delta),
+                    StreamEvent::RetryRollback { .. } => text.clear(),
                     _ => {}
                 }
             }
@@ -288,4 +319,14 @@ async fn opaque_recovery_after_tool_forbidden() {
 #[tokio::test]
 async fn opaque_recovery_cancel_invalidates_sockets() {
     opaque_recovery_public_case(true, None, false, false, true).await;
+}
+
+#[tokio::test]
+async fn opaque_recovery_unlimited_retries_https_after_fresh_websocket_rejection() {
+    opaque_recovery_retry_case(false, None, false, false, false, 10).await;
+}
+
+#[tokio::test]
+async fn opaque_recovery_unlimited_retries_https_after_persistent_websocket_rejection() {
+    opaque_recovery_retry_case(true, None, false, false, false, 10).await;
 }

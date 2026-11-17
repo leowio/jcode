@@ -4,6 +4,10 @@ use serde::de::DeserializeOwned;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+mod shared_project;
+pub use shared_project::{ProjectDataLock, shared_project_dir, shared_project_transaction,
+    shared_repository_identity, shared_repository_key};
+
 #[cfg(windows)]
 use std::collections::{HashMap, HashSet};
 #[cfg(windows)]

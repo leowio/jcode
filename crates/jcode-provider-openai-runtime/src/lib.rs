@@ -68,9 +68,6 @@ use model_capabilities::{
 };
 mod model_capabilities;
 
-/// Maximum number of retries for transient errors
-const MAX_RETRIES: u32 = 3;
-
 /// Base delay for exponential backoff (in milliseconds)
 const RETRY_BASE_DELAY_MS: u64 = 1000;
 const WEBSOCKET_UPGRADE_REQUIRED_ERROR: StatusCode = StatusCode::UPGRADE_REQUIRED;

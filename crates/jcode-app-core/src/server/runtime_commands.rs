@@ -4,6 +4,10 @@ use anyhow::{Result, bail};
 use jcode_harness_api::RuntimeCommand;
 use serde_json::{Value, json};
 
+#[path = "post_turn_feedback.rs"]
+mod post_turn_feedback;
+pub(super) use post_turn_feedback::{after_completed_turn, skip_feedback_for_turn};
+
 pub(super) fn boolean_action(
     args: &[String],
     current: bool,
@@ -47,49 +51,7 @@ pub(super) async fn execute(
                 _ => "swarm",
             };
             let (explicit_model, label, requested) = role_args(args, role)?;
-            let prompt = match command {
-                RuntimeCommand::Review => format!(
-                    "Independently review the current working tree changes. Inspect the diff, correctness, regressions, security and tests. Report concrete findings with file references. Do not edit files. User focus: {requested}"
-                ),
-                RuntimeCommand::Judge => format!(
-                    "Independently judge the current implementation against the user request. Inspect actual changes and verification evidence, identify unmet acceptance criteria and missing tests. Do not edit files. User focus: {requested}"
-                ),
-                _ if requested.trim().is_empty() => bail!("Usage: /subagent <task>"),
-                _ => requested,
-            };
-            let global = match command {
-                RuntimeCommand::Review => config.autoreview.model.clone(),
-                RuntimeCommand::Judge => config.autojudge.model.clone(),
-                _ => agent.subagent_model().or(config.agents.swarm_model.clone()),
-            };
-            let model = explicit_model.or_else(|| {
-                agent
-                    .session_for_split()
-                    .effective_agent_model(role, global)
-            });
-            let output = agent
-                .registry()
-                .execute(
-                    "swarm",
-                    json!({"action": "spawn", "label": label, "prompt": prompt, "model": model}),
-                    crate::tool::ToolContext {
-                        session_id: agent.session_id().into(),
-                        message_id: crate::id::new_id("msg"),
-                        tool_call_id: crate::id::new_id("call"),
-                        working_dir: agent.working_dir().map(std::path::PathBuf::from),
-                        stdin_request_tx: None,
-                        graceful_shutdown_signal: None,
-                        execution_mode: crate::tool::ToolExecutionMode::Direct,
-                    },
-                )
-                .await?;
-            let metadata = output
-                .metadata
-                .ok_or_else(|| anyhow::anyhow!("Spawn returned no structured session metadata"))?;
-            return Ok((
-                json!({"spawned_session_id": metadata["session_id"], "role": role, "model": model}),
-                output.output,
-            ));
+            return launch_role(agent, command, explicit_model, label, requested, None).await;
         }
         RuntimeCommand::ProviderTestCoverage => {
             let report = if args.is_empty() {
@@ -354,6 +316,70 @@ pub(super) async fn execute(
     };
     let message = serde_json::to_string_pretty(&data)?;
     Ok((data, message))
+}
+
+/// Shared native role launcher for manual commands and daemon post-turn hooks.
+async fn launch_role(
+    agent: &mut Agent,
+    command: RuntimeCommand,
+    explicit_model: Option<String>,
+    label: String,
+    requested: String,
+    spawn_mode: Option<&str>,
+) -> Result<(Value, String)> {
+    let config = crate::config::Config::load();
+    let role = match command {
+        RuntimeCommand::Review => "review",
+        RuntimeCommand::Judge => "judge",
+        _ => "swarm",
+    };
+    let prompt = match command {
+        RuntimeCommand::Review => format!(
+            "Independently review the current working tree changes. Inspect the diff, correctness, regressions, security and tests. Report concrete findings with file references. Do not edit files. User focus: {requested}"
+        ),
+        RuntimeCommand::Judge => format!(
+            "Independently judge the current implementation against the user request. Inspect actual changes and verification evidence, identify unmet acceptance criteria and missing tests. Do not edit files. User focus: {requested}"
+        ),
+        _ if requested.trim().is_empty() => bail!("Usage: /subagent <task>"),
+        _ => requested,
+    };
+    let global = match command {
+        RuntimeCommand::Review => config.autoreview.model.clone(),
+        RuntimeCommand::Judge => config.autojudge.model.clone(),
+        _ => agent.subagent_model().or(config.agents.swarm_model.clone()),
+    };
+    let model = explicit_model.or_else(|| {
+        agent
+            .session_for_split()
+            .effective_agent_model(role, global)
+    });
+    let mut input = json!({"action": "spawn", "label": label, "prompt": prompt, "model": model});
+    if let Some(mode) = spawn_mode {
+        input["spawn_mode"] = json!(mode);
+    }
+    let output = agent
+        .registry()
+        .execute(
+            "swarm",
+            input,
+            crate::tool::ToolContext {
+                session_id: agent.session_id().into(),
+                message_id: crate::id::new_id("msg"),
+                tool_call_id: crate::id::new_id("call"),
+                working_dir: agent.working_dir().map(std::path::PathBuf::from),
+                stdin_request_tx: None,
+                graceful_shutdown_signal: None,
+                execution_mode: crate::tool::ToolExecutionMode::Direct,
+            },
+        )
+        .await?;
+    let metadata = output
+        .metadata
+        .ok_or_else(|| anyhow::anyhow!("Spawn returned no structured session metadata"))?;
+    Ok((
+        json!({"spawned_session_id": metadata["session_id"], "role": role, "model": model}),
+        output.output,
+    ))
 }
 
 fn role_args(args: &[String], default_label: &str) -> Result<(Option<String>, String, String)> {

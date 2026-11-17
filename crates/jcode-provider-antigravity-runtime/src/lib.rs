@@ -405,37 +405,107 @@ impl AntigravityProvider {
             ],
         );
 
-        let response = self
-            .client
-            .post(generate_content_api_url())
-            .bearer_auth(&tokens.access_token)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header(reqwest::header::USER_AGENT, antigravity_user_agent())
-            .header("x-goog-api-client", X_GOOG_API_CLIENT)
-            .header(
-                "x-goog-request-params",
-                format!("project={}", request.project),
+        let config = jcode_base::config::config();
+        let policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+            config.provider.max_retries,
+            config.provider.retry_backoff_cap_secs,
+        );
+        let mut last_error = None;
+        let mut next_delay = None;
+        // Keep this exact request (including user_prompt_id) across transport
+        // retries. Schema/signature repairs remain separate bounded decisions.
+        for attempt in policy.attempts() {
+            if let Some(delay) = next_delay.take() {
+                tokio::time::sleep(delay).await;
+            }
+            let client = if attempt == 0 {
+                self.client.clone()
+            } else {
+                jcode_provider_core::fresh_transport_client()
+            };
+            let request_builder = client
+                .post(generate_content_api_url())
+                .bearer_auth(&tokens.access_token)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header(reqwest::header::USER_AGENT, antigravity_user_agent())
+                .header("x-goog-api-client", X_GOOG_API_CLIENT)
+                .header(
+                    "x-goog-request-params",
+                    format!("project={}", request.project),
+                )
+                .header("x-goog-client-metadata", client_metadata_header())
+                .json(&request);
+            let response = jcode_provider_core::transport::send_with_initial_response_timeout(
+                request_builder,
+                jcode_base::provider::stream_idle_timeout(),
             )
-            .header("x-goog-client-metadata", client_metadata_header())
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send Antigravity generateContent request")?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = jcode_base::util::http_error_body(response, "HTTP error").await;
-            anyhow::bail!(
-                "Antigravity generateContent failed (HTTP {}): {}",
-                status,
-                body.trim()
-            );
+            .await;
+            let response = match response {
+                Ok(response) => response,
+                Err(error)
+                    if jcode_provider_core::is_transient_transport_error(&format!("{error:#}"))
+                        && policy.can_retry(attempt) =>
+                {
+                    next_delay = Some(policy.delay(attempt.saturating_add(1), 1000, None));
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => {
+                    return Err(error)
+                        .context("Failed to send Antigravity generateContent request");
+                }
+            };
+            if !response.status().is_success() {
+                let status = response.status();
+                let retry_after = jcode_provider_core::retry_after::retry_after(response.headers());
+                let body = jcode_base::util::http_error_body(response, "HTTP error").await;
+                let error = jcode_provider_core::retry_after::error_with_retry_after(
+                    format!(
+                        "Antigravity generateContent failed (HTTP {status}): {}",
+                        body.trim()
+                    ),
+                    retry_after,
+                );
+                if retryable_antigravity_status(status, &body) && policy.can_retry(attempt) {
+                    next_delay = Some(policy.delay(
+                        attempt.saturating_add(1),
+                        1000,
+                        retry_after.map(|hint| hint.remaining()),
+                    ));
+                    last_error = Some(error);
+                    continue;
+                }
+                return Err(error);
+            }
+            let decoded =
+                tokio::time::timeout(jcode_base::provider::stream_idle_timeout(), response.json())
+                    .await;
+            match decoded {
+                Ok(Ok(response)) => return Ok(response),
+                Ok(Err(error))
+                    if transient_antigravity_transport_error(&error)
+                        && policy.can_retry(attempt) =>
+                {
+                    next_delay = Some(policy.delay(attempt.saturating_add(1), 1000, None));
+                    last_error = Some(anyhow::Error::new(error));
+                }
+                Ok(Err(error)) => {
+                    return Err(error)
+                        .context("Failed to decode Antigravity generateContent response");
+                }
+                Err(_) => {
+                    let error = anyhow::anyhow!(
+                        "Antigravity response body timed out waiting for completion"
+                    );
+                    if !policy.can_retry(attempt) {
+                        return Err(error);
+                    }
+                    next_delay = Some(policy.delay(attempt.saturating_add(1), 1000, None));
+                    last_error = Some(error);
+                }
+            }
         }
-
-        response
-            .json()
-            .await
-            .context("Failed to decode Antigravity generateContent response")
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Antigravity generateContent failed")))
     }
 }
 
@@ -467,6 +537,8 @@ impl Provider for AntigravityProvider {
         let (tx, rx) = mpsc::channel::<Result<jcode_message_types::StreamEvent>>(100);
 
         tokio::spawn(async move {
+            let monitor = tx.clone();
+            let _ = jcode_provider_core::retry_policy::while_consumer_open(&monitor, async move {
             let _ = tx
                 .send(Ok(StreamEvent::ConnectionType {
                     connection: "https".to_string(),
@@ -765,6 +837,7 @@ impl Provider for AntigravityProvider {
                     stop_reason: candidate.finish_reason.clone(),
                 }))
                 .await;
+            }).await;
         });
 
         Ok(Box::pin(ReceiverStream::new(rx)))
@@ -948,3 +1021,52 @@ impl Provider for AntigravityProvider {
 #[cfg(test)]
 #[path = "antigravity_tests.rs"]
 mod antigravity_tests;
+
+fn transient_antigravity_transport_error(error: &reqwest::Error) -> bool {
+    error.is_connect()
+        || error.is_timeout()
+        || jcode_provider_core::is_transient_transport_error(&format!("{error:?}"))
+}
+
+fn retryable_antigravity_status(status: reqwest::StatusCode, body: &str) -> bool {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let lower = body.to_ascii_lowercase();
+        return ![
+            "daily",
+            "per day",
+            "per_day",
+            "perday",
+            "billing",
+            "insufficient_quota",
+            "quota_exhausted",
+        ]
+        .iter()
+        .any(|reason| lower.contains(reason));
+    }
+    matches!(status.as_u16(), 408 | 500 | 502 | 503 | 504 | 529)
+}
+
+#[cfg(test)]
+mod transient_retry_tests {
+    use super::*;
+
+    #[test]
+    fn transient_statuses_retry_without_replaying_permanent_failures() {
+        for status in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(retryable_antigravity_status(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                "temporary failure"
+            ));
+        }
+        for status in [400, 401, 403, 404, 501, 505] {
+            assert!(!retryable_antigravity_status(
+                reqwest::StatusCode::from_u16(status).unwrap(),
+                "timeout overloaded"
+            ));
+        }
+        assert!(!retryable_antigravity_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            "daily quota exhausted"
+        ));
+    }
+}

@@ -7,6 +7,19 @@ use super::state_ui::RestoredReloadInput;
 use super::*;
 use crate::tui::{backend, keybind};
 
+// Apply a managed client override before either constructor can restore
+// history or queue unfinished-todo continuations. Invalid/unset values retain
+// the user's configured default; explicit runtime commands can still change it.
+fn initial_tui_auto_poke(configured: bool) -> bool {
+    match std::env::var("JCODE_TUI_AUTO_POKE").ok()
+        .as_deref().map(str::trim).map(str::to_ascii_lowercase).as_deref()
+    {
+        Some("0" | "false" | "off") => false,
+        Some("1" | "true" | "on") => true,
+        _ => configured,
+    }
+}
+
 impl App {
     pub(super) async fn begin_remote_send(
         &mut self,
@@ -19,7 +32,7 @@ impl App {
     }
 
     pub(super) fn schedule_pending_remote_retry(&mut self, reason: &str) -> bool {
-        self.schedule_pending_remote_retry_with_limit(reason, Self::AUTO_RETRY_MAX_ATTEMPTS)
+        self.schedule_pending_remote_retry_with_limit(reason, 0)
     }
 
     pub(super) fn schedule_pending_remote_network_wait(&mut self, reason: &str) -> bool {
@@ -34,11 +47,9 @@ impl App {
     /// failed) we wait regardless of the pending message's `auto_retry` flag
     /// and promote it to auto-retry so the tick-based resume re-sends it.
     ///
-    /// A provider-specific failure (for example DNS for one host) can persist
-    /// while the generic connectivity probe succeeds, so each forced wait
-    /// consumes one attempt from the per-turn retry budget and returns `false`
-    /// once it is spent. Offline probe re-waits (`force == false`) do not
-    /// consume attempts because no request was sent.
+    /// A provider-specific failure can persist while the generic connectivity
+    /// probe succeeds. Keep retrying with a bounded delay until cancellation;
+    /// offline probe re-waits do not count as provider attempts.
     pub(super) fn schedule_pending_remote_network_wait_with_force(
         &mut self,
         reason: &str,
@@ -48,9 +59,6 @@ impl App {
             return false;
         };
         if force {
-            if pending.retry_attempts >= Self::AUTO_RETRY_MAX_ATTEMPTS {
-                return false;
-            }
             pending.retry_attempts = pending.retry_attempts.saturating_add(1);
         }
         if !pending.auto_retry {
@@ -62,8 +70,11 @@ impl App {
         }
 
         let plan = crate::network_retry::wait_plan();
-        let retry_at =
-            Instant::now() + Duration::from_secs(5 * u64::from(pending.retry_attempts.max(1)));
+        let retry_at = Instant::now()
+            + Duration::from_secs(
+                (5 * u64::from(pending.retry_attempts.max(1)))
+                    .min(Self::AUTO_RETRY_BACKOFF_CAP_SECS),
+            );
         pending.retry_at = Some(retry_at);
         self.rate_limit_reset = Some(retry_at);
         self.status = ProcessingStatus::WaitingForNetwork {
@@ -102,7 +113,7 @@ impl App {
     pub(super) fn schedule_pending_remote_retry_with_limit(
         &mut self,
         reason: &str,
-        max_attempts: u8,
+        max_attempts: u32,
     ) -> bool {
         let Some(pending) = self.rate_limit_pending_message.as_mut() else {
             return false;
@@ -112,12 +123,13 @@ impl App {
         }
         let outcome = {
             let current_attempts = pending.retry_attempts;
-            if current_attempts >= max_attempts {
+            if max_attempts != 0 && current_attempts >= max_attempts {
                 Err(current_attempts)
             } else {
-                pending.retry_attempts += 1;
+                pending.retry_attempts = pending.retry_attempts.saturating_add(1);
                 let retry_attempts = pending.retry_attempts;
-                let backoff_secs = Self::AUTO_RETRY_BASE_DELAY_SECS * u64::from(retry_attempts);
+                let backoff_secs = (Self::AUTO_RETRY_BASE_DELAY_SECS * u64::from(retry_attempts))
+                    .min(Self::AUTO_RETRY_BACKOFF_CAP_SECS);
                 let retry_at = Instant::now() + Duration::from_secs(backoff_secs);
                 pending.retry_at = Some(retry_at);
                 Ok((retry_attempts, backoff_secs, retry_at))
@@ -138,10 +150,14 @@ impl App {
             }
             Ok((retry_attempts, backoff_secs, retry_at)) => {
                 self.rate_limit_reset = Some(retry_at);
+                let attempt_label = if max_attempts == 0 {
+                    retry_attempts.to_string()
+                } else {
+                    format!("{retry_attempts}/{max_attempts}")
+                };
                 let content = format!(
-                    "⚡ Connection lost - retrying (attempt {}/{}, in {}s) - {}",
-                    retry_attempts,
-                    max_attempts,
+                    "⚡ Connection lost - retrying (attempt {}, in {}s) - {}",
+                    attempt_label,
                     backoff_secs,
                     reason
                         .trim()
@@ -182,6 +198,7 @@ impl App {
     pub(super) fn clear_pending_remote_retry(&mut self) {
         self.rate_limit_pending_message = None;
         self.rate_limit_reset = None;
+        self.clear_retrying_outcome();
     }
 
     /// Stop automatically resuming a held turn whose retry budget is spent.
@@ -280,6 +297,7 @@ impl App {
         }
         let display = config().display.clone();
         let features = config().features.clone();
+        let auto_poke_enabled = initial_tui_auto_poke(features.auto_poke);
         let autoreview_enabled = session
             .autoreview_enabled
             .unwrap_or(config().autoreview.enabled);
@@ -384,8 +402,8 @@ impl App {
             last_api_completed_model: None,
             last_turn_input_tokens: None,
             pending_turn: false,
-            auto_poke_incomplete_todos: features.auto_poke,
-            auto_poke_default_on: features.auto_poke,
+            auto_poke_incomplete_todos: auto_poke_enabled,
+            auto_poke_default_on: auto_poke_enabled,
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
             todo_completion_gate_attempts: 0,
@@ -763,6 +781,7 @@ impl App {
         session.ensure_initial_session_context_message();
         let display = config().display.clone();
         let features = config().features.clone();
+        let auto_poke_enabled = initial_tui_auto_poke(features.auto_poke);
         let autoreview_enabled = session
             .autoreview_enabled
             .unwrap_or(config().autoreview.enabled);
@@ -897,8 +916,8 @@ impl App {
             last_api_completed_model: None,
             last_turn_input_tokens: None,
             pending_turn: false,
-            auto_poke_incomplete_todos: features.auto_poke,
-            auto_poke_default_on: features.auto_poke,
+            auto_poke_incomplete_todos: auto_poke_enabled,
+            auto_poke_default_on: auto_poke_enabled,
             todo_confidence_spike_challenged: false,
             todo_gate_digest_delivered: false,
             todo_completion_gate_attempts: 0,

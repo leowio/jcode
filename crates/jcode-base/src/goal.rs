@@ -73,6 +73,7 @@ pub struct GoalDisplayResult {
 }
 
 pub fn create_goal(input: GoalCreateInput, working_dir: Option<&Path>) -> Result<Goal> {
+    let _project_transaction = crate::storage::shared_project_transaction(working_dir, "goals")?;
     if input.title.trim().is_empty() {
         anyhow::bail!("goal title cannot be empty");
     }
@@ -101,6 +102,7 @@ pub fn update_goal(
     working_dir: Option<&Path>,
     update: GoalUpdateInput,
 ) -> Result<Option<Goal>> {
+    let _project_transaction = crate::storage::shared_project_transaction(working_dir, "goals")?;
     let Some(mut goal) = load_goal(id, scope_hint, working_dir)? else {
         return Ok(None);
     };
@@ -243,7 +245,9 @@ pub fn load_attached_goal(session_id: &str, working_dir: Option<&Path>) -> Resul
             return Ok(None);
         };
         let current_hash = project_hash(dir);
-        if attachment.project_hash.as_deref() != Some(current_hash.as_str()) {
+        if attachment.project_hash.as_deref() != Some(current_hash.as_str())
+            && attachment.project_hash.as_deref() != Some(legacy_project_hash(dir).as_str())
+        {
             return Ok(None);
         }
     }
@@ -531,6 +535,9 @@ fn project_goals_dir(working_dir: Option<&Path>) -> Result<Option<PathBuf>> {
     let Some(dir) = working_dir else {
         return Ok(None);
     };
+    if let Some(shared) = crate::storage::shared_project_dir(dir)? {
+        return Ok(Some(shared.join("goals")));
+    }
     Ok(Some(
         crate::storage::jcode_dir()?
             .join("goals")
@@ -569,6 +576,13 @@ fn sort_goals(goals: &mut [Goal]) {
 }
 
 fn project_hash(path: &Path) -> String {
+    if std::env::var_os("JCODE_SHARED_PROJECT_HOME").is_some_and(|root| !root.is_empty())
+        && let Some(identity) = crate::storage::shared_repository_identity(path)
+    { return crate::storage::shared_repository_key(&identity); }
+    legacy_project_hash(path)
+}
+
+fn legacy_project_hash(path: &Path) -> String {
     use std::collections::hash_map::DefaultHasher;
     let mut hasher = DefaultHasher::new();
     path.hash(&mut hasher);

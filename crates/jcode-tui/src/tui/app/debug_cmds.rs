@@ -114,6 +114,7 @@ impl App {
             // Return current state as JSON for easier parsing
             serde_json::json!({
                 "processing": self.is_processing,
+                "auto_poke_enabled": self.auto_poke_incomplete_todos,
                 "processing_status": format!("{:?}", self.status),
                 "current_message_id": self.current_message_id,
                 "pending_soft_interrupts": self.pending_soft_interrupts.len(),

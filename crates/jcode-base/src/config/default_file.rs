@@ -573,9 +573,10 @@ cross_provider_failover = "countdown"
 # (high 2x, xhigh 3x, max/swarm 4x) since they think silently for much longer.
 # stream_idle_timeout_secs = 600
 # Maximum attempts for transient 429/5xx/network failures, including the first
-# request. Retries honor Retry-After and use capped exponential backoff.
+# request. Zero (the default) retries until cancelled. Retries honor Retry-After
+# and use capped exponential backoff.
 # Env overrides: JCODE_MAX_RETRIES, JCODE_RETRY_BACKOFF_CAP_SECS.
-# max_retries = 8
+# max_retries = 0
 # retry_backoff_cap_secs = 30
 # Request-body compression. Every turn re-uploads the whole conversation; on a
 # slow uplink compression cuts that upload 2-4x and lowers time-to-first-token.

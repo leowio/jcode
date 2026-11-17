@@ -404,52 +404,71 @@ fn test_remote_failover_ignores_confirmation_before_request_is_sent() {
 }
 
 #[test]
-fn test_remote_failover_stops_when_cross_route_retry_budget_is_spent() {
-    with_temp_jcode_home(|| {
-        write_test_config("[provider]\ncross_provider_failover = \"countdown\"\n");
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let _guard = rt.enter();
-        let (mut app, mut connection) = remote_exact_failover_fixture();
-        let payload = app.pending_fallback_resend.take().unwrap();
-        app.pending_automatic_failover_route = None;
-        app.rate_limit_pending_message = Some(PendingRemoteMessage {
-            content: payload.content,
-            images: payload.images,
-            is_system: payload.is_system,
-            system_reminder: payload.system_reminder,
-            auto_retry: true,
-            retry_attempts: App::AUTO_RETRY_MAX_ATTEMPTS,
-            retry_at: None,
+fn test_remote_failover_keeps_retrying_beyond_old_cross_route_budget() {
+    for immediate in [false, true] {
+        with_temp_jcode_home(|| {
+            // The fixture stages its initial failover immediately. Then test
+            // both native policies with a retry count beyond the former cap.
+            write_test_config("[provider]\ncross_provider_failover = \"countdown\"\n");
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _guard = rt.enter();
+            let (mut app, mut connection) = remote_exact_failover_fixture();
+            let payload = app.pending_fallback_resend.take().unwrap();
+            app.pending_automatic_failover_route = None;
+            write_test_config(&format!(
+                "[provider]\ncross_provider_failover = \"countdown\"\nexhausted_usage_immediate_failover = {immediate}\n"
+            ));
+            app.rate_limit_pending_message = Some(PendingRemoteMessage {
+                content: payload.content,
+                images: payload.images,
+                is_system: payload.is_system,
+                system_reminder: payload.system_reminder,
+                auto_retry: true,
+                retry_attempts: 300,
+                retry_at: None,
+            });
+            let prompt = jcode_provider_core::ProviderFailoverPrompt {
+                from_provider: "claude".into(),
+                from_label: "Anthropic".into(),
+                to_provider: "openai".into(),
+                to_label: "OpenAI fox".into(),
+                target_route: Some("openai-oauth@openai-fox:gpt-5.4".into()),
+                reason: "OAuth usage exhausted".into(),
+                estimated_input_chars: 0,
+                estimated_input_tokens: 0,
+            };
+            app.handle_server_event(
+                crate::protocol::ServerEvent::Error {
+                    id: 23,
+                    message: prompt.to_error_message(),
+                    retry_after_secs: None,
+                },
+                &mut connection,
+            );
+            if immediate {
+                assert!(app.pending_provider_failover.is_none());
+                assert!(app.pending_automatic_failover_route.is_some());
+                assert_eq!(
+                    app.pending_fallback_resend.as_ref().unwrap().retry_attempts,
+                    300
+                );
+            } else {
+                let pending = app
+                    .pending_provider_failover
+                    .as_ref()
+                    .expect("countdown remains armed");
+                assert_eq!(pending.remote_resend.as_ref().unwrap().retry_attempts, 300);
+                assert!(app.pending_automatic_failover_route.is_none());
+            }
+            assert!(app.pending_automatic_failover_request_id.is_none());
+            assert!(app.rate_limit_pending_message.is_none());
+            assert!(
+                !app.display_messages()
+                    .iter()
+                    .any(|m| m.content.contains("Stopped automatic failover"))
+            );
         });
-        let prompt = jcode_provider_core::ProviderFailoverPrompt {
-            from_provider: "claude".into(),
-            from_label: "Anthropic".into(),
-            to_provider: "openai".into(),
-            to_label: "OpenAI fox".into(),
-            target_route: Some("openai-oauth@openai-fox:gpt-5.4".into()),
-            reason: "OAuth usage exhausted".into(),
-            estimated_input_chars: 0,
-            estimated_input_tokens: 0,
-        };
-        app.handle_server_event(
-            crate::protocol::ServerEvent::Error {
-                id: 23,
-                message: prompt.to_error_message(),
-                retry_after_secs: None,
-            },
-            &mut connection,
-        );
-        assert!(app.pending_provider_failover.is_none());
-        assert!(app.pending_automatic_failover_route.is_none());
-        assert!(app.pending_automatic_failover_request_id.is_none());
-        assert!(app.rate_limit_pending_message.is_none());
-        assert_eq!(app.input, "hi");
-        assert!(
-            app.display_messages()
-                .iter()
-                .any(|m| m.content.contains("Stopped automatic failover"))
-        );
-    });
+    }
 }
 
 #[test]

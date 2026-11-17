@@ -995,3 +995,54 @@ fn mcp_source_logs_explain_provenance_without_config_values() {
     assert!(!imported.contains("TOKEN"));
     assert!(!imported.contains("inline-secret"));
 }
+
+
+#[test]
+fn managed_system_mcp_catalog_excludes_home_project_and_import_sources() {
+    let _env_lock = crate::storage::lock_test_env();
+    let private = tempfile::tempdir().unwrap();
+    let user_home = tempfile::tempdir().unwrap();
+    struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            for (key, value) in &self.0 {
+                if let Some(value) = value { crate::env::set_var(key, value); }
+                else { crate::env::remove_var(key); }
+            }
+        }
+    }
+    let _restore = Restore(["JCODE_HOME", "JCODE_SYSTEM_MCP_ONLY", "JCODE_DISABLE_CLAUDE_MCP"]
+        .into_iter().map(|key| (key, std::env::var_os(key))).collect());
+    crate::env::set_var("JCODE_HOME", private.path());
+    crate::env::set_var("JCODE_SYSTEM_MCP_ONLY", "1");
+    crate::env::remove_var("JCODE_DISABLE_CLAUDE_MCP");
+    let external = private.path().join("external");
+    std::fs::create_dir_all(external.join(".codex")).unwrap();
+    std::fs::create_dir_all(external.join(".claude")).unwrap();
+    std::fs::write(external.join(".codex/config.toml"), "[mcp_servers.codex-leak]\ncommand='codex-server'\n").unwrap();
+    std::fs::write(external.join(".claude.json"), r#"{"mcpServers":{"claude-leak":{"command":"claude-server"}}}"#).unwrap();
+    std::fs::write(external.join(".claude/mcp.json"), r#"{"mcpServers":{"legacy-claude-leak":{"command":"claude-server"}}}"#).unwrap();
+    for relative in [".jcode/mcp.json", ".mcp.json", ".claude/mcp.json"] {
+        let path = user_home.path().join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, r#"{"mcpServers":{"goals":{"command":"legacy-goals-server"}}}"#).unwrap();
+    }
+    let catalog = private.path().join("mcp.json");
+    let policy = r#"{"mcpServers":{
+        "chatcut":{"command":"chatcut"},"axiom":{"command":"axiom"},
+        "posthog":{"type":"http","url":"https://example.invalid/posthog"},
+        "playwright":{"command":"playwright"},"invalid":{"type":"http"}}}"#;
+    std::fs::write(&catalog, policy).unwrap();
+    let loaded = McpConfig::load_for_dir(Some(user_home.path()));
+    let mut names = loaded.servers.keys().map(String::as_str).collect::<Vec<_>>(); names.sort();
+    assert_eq!(names, ["axiom", "chatcut", "playwright", "posthog"]);
+    assert_eq!(std::fs::read_to_string(&catalog).unwrap(), policy);
+    // A missing canonical catalog is empty, never an implicit migration from
+    // Codex or a fallback to HOME's project-local/global legacy goal server.
+    std::fs::remove_file(&catalog).unwrap();
+    assert!(McpConfig::load_for_dir(Some(user_home.path())).servers.is_empty());
+    assert!(!catalog.exists(), "system-only mode must not run Codex import");
+    // Ordinary mode retains project-local compatibility.
+    crate::env::set_var("JCODE_SYSTEM_MCP_ONLY", "0");
+    assert!(McpConfig::load_for_dir(Some(user_home.path())).servers.contains_key("goals"));
+}

@@ -53,11 +53,15 @@ pub struct StateReport {
 struct HerdrEnv {
     bin: String,
     pane_id: String,
+    core: bool,
 }
 
 impl HerdrEnv {
     fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Option<Self> {
         let non_empty = |key: &str| get(key).filter(|value| !value.trim().is_empty());
+        if let Some(terminal) = non_empty("HC_TERMINAL_ID") {
+            return Some(Self { bin: "hc".into(), pane_id: terminal, core: true });
+        }
         if non_empty("HERDR_ENV").as_deref() != Some("1") {
             return None;
         }
@@ -67,6 +71,7 @@ impl HerdrEnv {
         Some(Self {
             bin: non_empty("HERDR_BIN_PATH")?,
             pane_id: non_empty("HERDR_PANE_ID")?,
+            core: false,
         })
     }
 }
@@ -170,7 +175,10 @@ pub fn release() {
         slot.pending = None;
     }
     let seq = next_seq();
-    run_herdr(&reporter.env.bin, &release_args(&reporter.env.pane_id, seq));
+    let args = if reporter.env.core {
+        vec!["label".into(), reporter.env.pane_id.clone(), "td.agent=".into(), "td.session=".into(), "td.session-agent=".into()]
+    } else { release_args(&reporter.env.pane_id, seq) };
+    run_herdr(&reporter.env.bin, &args);
 }
 
 fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
@@ -197,6 +205,15 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
 }
 
 fn send_report(env: &HerdrEnv, mut report: StateReport) {
+    if env.core {
+        // OSC 7501 remains the status authority. Labels carry only the exact
+        // native session selected by this TUI, never a daemon's newest session.
+        let args = vec!["label".into(), env.pane_id.clone(), "td.agent=jcode".into(),
+            format!("td.session={}", report.session_id.as_deref().unwrap_or("")),
+            "td.session-agent=jcode".into()];
+        run_herdr(&env.bin, &args);
+        return;
+    }
     if RESUME_UNSUPPORTED.load(Ordering::Relaxed) {
         report.resume_argv = None;
     }
@@ -407,6 +424,7 @@ mod tests {
             Some(HerdrEnv {
                 bin: "/usr/bin/herdr".into(),
                 pane_id: "p1".into()
+                ,core: false
             })
         );
         assert_eq!(env(&[]), None);
@@ -568,6 +586,7 @@ mod tests {
             let env = HerdrEnv {
                 bin: bin.display().to_string(),
                 pane_id: "p1".into(),
+                core: false,
             };
             Self {
                 dir,

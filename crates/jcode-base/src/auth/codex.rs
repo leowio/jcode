@@ -107,8 +107,90 @@ fn relabel_accounts(auth: &mut JcodeOpenAiAuthFile) -> bool {
     outcome.changed
 }
 
+/// Opt-in account storage shared by otherwise private Jcode runtimes.
+/// Sessions, other providers, and all non-auth state still use JCODE_HOME.
+pub(crate) fn openai_auth_home() -> Result<PathBuf> {
+    let Some(value) = std::env::var_os("JCODE_SHARED_OPENAI_AUTH_HOME") else {
+        return crate::storage::jcode_dir();
+    };
+    let path = PathBuf::from(value);
+    anyhow::ensure!(path.is_absolute(), "Shared OpenAI auth directory must be absolute");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&path)?;
+        let metadata = std::fs::symlink_metadata(&path)?;
+        anyhow::ensure!(
+            metadata.is_dir() && !metadata.file_type().is_symlink()
+                && metadata.uid() == unsafe { libc::geteuid() }
+                && metadata.mode() & 0o077 == 0,
+            "Shared OpenAI auth directory must be private and owned"
+        );
+        Ok(path)
+    }
+    #[cfg(not(unix))]
+    anyhow::bail!("Shared OpenAI auth requires Unix cross-process locking")
+}
+
 fn jcode_auth_path() -> Result<PathBuf> {
-    Ok(crate::storage::jcode_dir()?.join("openai-auth.json"))
+    let path = openai_auth_home()?.join("openai-auth.json");
+    if std::env::var_os("JCODE_SHARED_OPENAI_AUTH_HOME").is_some() {
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::symlink_metadata(&path) {
+            use std::os::unix::fs::MetadataExt;
+            anyhow::ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && metadata.mode() & 0o077 == 0 && metadata.nlink() == 1,
+                "Shared OpenAI auth file must be a private owned regular file"
+            );
+        }
+    }
+    Ok(path)
+}
+
+/// This separate lock spans the asynchronous refresh grant and persistence.
+/// A plain owned file is Send, unlike the reentrant short store-transaction
+/// guard. Never unlink this sidecar: its inode coordinates all runtimes.
+pub(crate) async fn lock_openai_refresh() -> Result<std::fs::File> {
+    let home = openai_auth_home()?;
+    tokio::task::spawn_blocking(move || open_openai_refresh_lock(&home))
+        .await.context("OpenAI refresh lock task failed")?
+}
+
+#[cfg(unix)]
+fn open_openai_refresh_lock(home: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let directory = std::fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(home)?;
+    let metadata = directory.metadata()?;
+    anyhow::ensure!(metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & 0o022 == 0,
+        "Unsafe OpenAI refresh directory ownership or permissions");
+    let name = c".openai-refresh.lock";
+    let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(),
+        libc::O_CREAT | libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK, 0o600) };
+    if fd < 0 { return Err(std::io::Error::last_os_error().into()); }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    anyhow::ensure!(metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.nlink() == 1 && metadata.mode() & 0o777 == 0o600,
+        "Unsafe OpenAI refresh lock type, owner, links or permissions");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { return Ok(file); }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock && error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error.into());
+        }
+        anyhow::ensure!(std::time::Instant::now() < deadline, "Timed out waiting for OpenAI refresh lock");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+#[cfg(not(unix))]
+fn open_openai_refresh_lock(_home: &std::path::Path) -> Result<std::fs::File> {
+    anyhow::bail!("OpenAI cross-process refresh locking requires Unix")
 }
 
 fn legacy_auth_path() -> Result<PathBuf> {
@@ -161,7 +243,7 @@ pub fn has_unconsented_legacy_credentials() -> bool {
 
 pub fn load_auth_file() -> Result<JcodeOpenAiAuthFile> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let path = jcode_auth_path()?;
     let mut auth = if path.exists() {
         crate::storage::harden_secret_file_permissions(&path);
@@ -183,7 +265,7 @@ pub fn load_auth_file() -> Result<JcodeOpenAiAuthFile> {
 
 pub fn save_auth_file(auth: &JcodeOpenAiAuthFile) -> Result<()> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let auth_path = jcode_auth_path()?;
     let clean = JcodeOpenAiAuthFile {
         openai_accounts: auth.openai_accounts.clone(),
@@ -238,7 +320,7 @@ pub fn active_account_label() -> Option<String> {
 
 pub fn set_active_account(label: &str) -> Result<()> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     crate::auth::account_store::set_active_account(
         label,
@@ -254,7 +336,7 @@ pub fn set_active_account(label: &str) -> Result<()> {
 
 pub fn upsert_account(account: OpenAiAccount) -> Result<String> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     let label = crate::auth::account_store::upsert_account(
         ACCOUNT_LABEL_PREFIX,
@@ -270,7 +352,7 @@ pub fn upsert_account(account: OpenAiAccount) -> Result<String> {
 
 pub fn remove_account(label: &str) -> Result<()> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     let before = auth.openai_accounts.len();
     auth.openai_accounts
@@ -294,7 +376,7 @@ pub fn remove_account(label: &str) -> Result<()> {
 
 pub fn clear_accounts() -> Result<usize> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     let removed = auth.openai_accounts.len();
     auth.openai_accounts.clear();
@@ -313,7 +395,7 @@ pub fn update_account_tokens(
     expires_at: Option<i64>,
 ) -> Result<()> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     if let Some(account) = auth
         .openai_accounts
@@ -348,7 +430,7 @@ pub fn update_account_tokens(
 
 pub fn update_account_profile(label: &str, email: Option<String>) -> Result<()> {
     let _store_lock =
-        crate::auth::account_store::lock_store(&crate::storage::jcode_dir()?, "openai-auth.json")?;
+        crate::auth::account_store::lock_store(&openai_auth_home()?, "openai-auth.json")?;
     let mut auth = load_auth_file()?;
     if let Some(account) = auth
         .openai_accounts
@@ -388,6 +470,14 @@ pub fn load_oauth_credentials() -> Result<CodexCredentials> {
 
 fn load_oauth_credentials_internal(return_expired: bool) -> Result<CodexCredentials> {
     let now_ms = chrono::Utc::now().timestamp_millis();
+    // Managed shared accounts are authoritative. A stale private legacy copy
+    // must not mask an expired canonical token or bypass its validation.
+    if std::env::var_os("JCODE_SHARED_OPENAI_AUTH_HOME").is_some() {
+        let credentials = load_jcode_credentials()?;
+        anyhow::ensure!(return_expired || credentials.expires_at.map(|expiry| expiry > now_ms).unwrap_or(true),
+            "Shared OpenAI OAuth tokens have expired");
+        return Ok(credentials);
+    }
     let mut expired_candidates: Vec<(&str, CodexCredentials)> = Vec::new();
     let legacy_allowed = legacy_auth_allowed();
 

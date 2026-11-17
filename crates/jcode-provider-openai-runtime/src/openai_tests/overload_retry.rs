@@ -7,6 +7,7 @@ async fn overload_public_retry_case(recover: bool, partial: bool) {
     let addr = listener.local_addr().unwrap();
     let _base = EnvVarGuard::set("JCODE_OPENAI_API_BASE", &format!("http://{addr}/v1"));
     let _idle = EnvVarGuard::set("JCODE_STREAM_IDLE_TIMEOUT_SECS", "1");
+    let _attempts = EnvVarGuard::set("JCODE_MAX_RETRIES", "3");
     jcode_base::config::invalidate_config_cache();
     let server = tokio::spawn(async move {
         let mut attempts = 0;
@@ -56,7 +57,7 @@ async fn overload_public_retry_case(recover: bool, partial: bool) {
                 tcp.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
                 let mut buf = [0; 1];
                 assert_eq!(tcp.read(&mut buf).await.unwrap(), 0);
-                if attempts == MAX_RETRIES {
+                if attempts == 3 {
                     return attempts;
                 }
             }
@@ -110,7 +111,7 @@ async fn overload_public_retry_case(recover: bool, partial: bool) {
             assert_eq!(errors.len(), 1, "{errors:?}");
             assert!(errors[0].contains("server_is_overloaded"), "{errors:?}");
             assert!(errors[0].contains("Stream read timeout"), "{errors:?}");
-            assert_eq!(attempts, MAX_RETRIES);
+            assert_eq!(attempts, 3);
         }
     })
     .await

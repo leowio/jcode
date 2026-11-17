@@ -38,6 +38,38 @@ pub(super) fn should_retry_recoverable_rate_limit(
 
 /// Check if an error is transient and should be retried
 pub(super) fn is_retryable_error(error_str: &str) -> bool {
+    // Explicit protocol failures take precedence over suggestive words in an
+    // untrusted response body; an invalid login/request never becomes an
+    // endless retry just because the body also mentions overload or timeout.
+    if let Some(rest) = error_str
+        .split_once("anthropic api error (")
+        .map(|(_, rest)| rest)
+    {
+        let code = rest
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        match code.parse::<u16>().ok() {
+            Some(408 | 429 | 500 | 502 | 503 | 504 | 529) => return true,
+            Some(507) => {
+                return error_str.contains("exceeded request buffer limit while retrying upstream");
+            }
+            Some(400..=599) => return false,
+            _ => {}
+        }
+    }
+    if [
+        "authentication_error",
+        "permission_error",
+        "invalid_request_error",
+        "insufficient_quota",
+    ]
+    .iter()
+    .any(|kind| error_str.contains(kind))
+    {
+        return false;
+    }
+
     jcode_provider_core::is_transient_transport_error(error_str)
         // Server errors (5xx)
         || error_str.contains("500 internal server error")
@@ -53,28 +85,6 @@ pub(super) fn is_retryable_error(error_str: &str) -> bool {
         || error_str.contains("api_error")
         || error_str.contains("internal server error")
 }
-
-/// Whether the retry loop should run another attempt after `attempt` (0-based)
-/// failed with `error_str` (lowercased).
-///
-/// Every transient error gets [`MAX_RETRIES`] attempts. Pure transport faults
-/// get up to [`TRANSPORT_MAX_RETRIES`], provided the first failure was less
-/// than [`TRANSPORT_RETRY_WINDOW`] ago, so a brief network blip (Wi-Fi roam,
-/// DHCP renewal) is outlasted without letting slow timeouts stall the turn.
-pub(super) fn should_retry_transient(
-    error_str: &str,
-    attempt: u32,
-    since_first_failure: std::time::Duration,
-) -> bool {
-    if !is_retryable_error(error_str) {
-        return false;
-    }
-    attempt + 1 < MAX_RETRIES
-        || (jcode_provider_core::is_transient_transport_error(error_str)
-            && attempt + 1 < TRANSPORT_MAX_RETRIES
-            && since_first_failure < TRANSPORT_RETRY_WINDOW)
-}
-
 pub(super) fn is_fable_scoped_limit_error(model: &str, error: &str) -> bool {
     let model = strip_1m_suffix(model).to_ascii_lowercase();
     if !model.contains("fable") {
@@ -295,75 +305,33 @@ pub(super) fn is_oauth_catalog_auth_error(error_str: &str) -> bool {
 }
 
 #[cfg(test)]
-mod transport_retry_tests {
-    use super::*;
-    use std::time::Duration;
-
-    /// The exact failure a Wi-Fi roam produced in the wild (lowercased chain).
-    const ROAM_ERROR: &str = "failed to send request to anthropic api: error sending request for url \
-        (https://api.anthropic.com/v1/messages?beta=true): client error (sendrequest): http2 error: \
-        stream error received: unspecific protocol error detected";
+mod retry_classification_tests {
+    use super::is_retryable_error;
 
     #[test]
-    fn transport_faults_outlast_the_default_budget() {
-        for attempt in 0..TRANSPORT_MAX_RETRIES - 1 {
-            assert!(
-                should_retry_transient(ROAM_ERROR, attempt, Duration::from_secs(10)),
-                "attempt {attempt} should retry"
+    fn protocol_status_takes_precedence_over_response_body() {
+        for (error, expected) in [
+            (
+                "Anthropic API error (401 Unauthorized): overloaded api_error timeout",
+                false,
+            ),
+            (
+                "Anthropic API error (400 Bad Request): rate_limit_error",
+                false,
+            ),
+            ("Anthropic API error (408 Request Timeout): {}", true),
+            ("Anthropic API error (429 Too Many Requests): {}", true),
+            ("Anthropic API error (529 <unknown status code>): {}", true),
+            (
+                "Anthropic API error (501 Not Implemented): overloaded",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                is_retryable_error(&error.to_ascii_lowercase()),
+                expected,
+                "{error}"
             );
         }
-        assert!(!should_retry_transient(
-            ROAM_ERROR,
-            TRANSPORT_MAX_RETRIES - 1,
-            Duration::from_secs(10)
-        ));
-    }
-
-    #[test]
-    fn backoff_covers_a_network_blip() {
-        // Lower jitter bound (0.8x) of 1s, 2s, 4s, 8s, 16s.
-        let minimum_wait_ms: u64 = (1..TRANSPORT_MAX_RETRIES)
-            .map(|attempt| RETRY_BASE_DELAY_MS * (1 << (attempt - 1)) * 8 / 10)
-            .sum();
-        assert!(minimum_wait_ms >= 20_000, "only waits {minimum_wait_ms}ms");
-    }
-
-    #[test]
-    fn extended_transport_retries_stop_after_the_window() {
-        assert!(!should_retry_transient(
-            ROAM_ERROR,
-            MAX_RETRIES - 1,
-            TRANSPORT_RETRY_WINDOW
-        ));
-        // The default budget is never shortened by the window.
-        assert!(should_retry_transient(
-            ROAM_ERROR,
-            0,
-            TRANSPORT_RETRY_WINDOW
-        ));
-    }
-
-    #[test]
-    fn server_errors_keep_the_default_budget() {
-        let overloaded = "529 overloaded";
-        assert!(should_retry_transient(
-            overloaded,
-            MAX_RETRIES - 2,
-            Duration::ZERO
-        ));
-        assert!(!should_retry_transient(
-            overloaded,
-            MAX_RETRIES - 1,
-            Duration::ZERO
-        ));
-    }
-
-    #[test]
-    fn deterministic_errors_never_retry() {
-        assert!(!should_retry_transient(
-            "401 unauthorized",
-            0,
-            Duration::ZERO
-        ));
     }
 }

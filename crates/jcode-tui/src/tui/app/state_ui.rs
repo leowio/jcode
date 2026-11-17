@@ -638,7 +638,8 @@ impl App {
                     retry_attempts: pending
                         .get("retry_attempts")
                         .and_then(|v| v.as_u64())
-                        .unwrap_or(0) as u8,
+                        .unwrap_or(0)
+                        .min(u64::from(u32::MAX)) as u32,
                     retry_at: None,
                 });
             let rate_limit_reset = value

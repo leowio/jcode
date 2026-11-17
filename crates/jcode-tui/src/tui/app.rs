@@ -169,7 +169,7 @@ struct PendingRemoteMessage {
     is_system: bool,
     system_reminder: Option<String>,
     auto_retry: bool,
-    retry_attempts: u8,
+    retry_attempts: u32,
     retry_at: Option<Instant>,
 }
 
@@ -434,7 +434,7 @@ struct PendingFallbackOffer {
 #[derive(Debug, Clone)]
 struct FallbackResendPayload {
     /// Automatic retry budget already spent by this turn, across routes.
-    retry_attempts: u8,
+    retry_attempts: u32,
     /// Expanded message content that was sent to the server.
     content: String,
     /// Inline image attachments that accompanied the message.
@@ -1938,7 +1938,7 @@ impl Provider for InertRuntimeProvider {
 
 impl App {
     const AUTO_RETRY_BASE_DELAY_SECS: u64 = 2;
-    const AUTO_RETRY_MAX_ATTEMPTS: u8 = 3;
+    const AUTO_RETRY_BACKOFF_CAP_SECS: u64 = 30;
     /// Budget for completion-confidence gate nudges per auto-poke cycle.
     /// Observed live: a session that stopped updating its todos was re-nudged
     /// with the same hidden continuation every ~5 seconds indefinitely, one

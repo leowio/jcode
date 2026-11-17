@@ -108,78 +108,135 @@ fn opaque_rejection_requires_exact_shape_and_no_response_activity() {
     }
 }
 
-/// This is intentionally outside the generic retry loop. Even a transient
-/// failure of this single HTTPS attempt must not schedule another replay.
+/// Switch an opaque WebSocket rejection to HTTPS once, then apply the same
+/// transient-error policy to HTTPS only. Provider output is rolled back before
+/// a replay; the agent has not executed any streamed tool calls at this point.
 pub(super) async fn recover_opaque_ws_rejection(
     credentials: Arc<RwLock<CodexCredentials>>,
     account_label: Option<String>,
     request: Value,
     tx: &mpsc::Sender<Result<StreamEvent>>,
+    retry_policy: jcode_provider_core::retry_policy::RetryPolicy,
+    max_attempts: u32,
 ) {
-    emit_status_detail(tx, "opaque websocket rejection: trying HTTPS once").await;
+    emit_status_detail(tx, "opaque websocket rejection: trying HTTPS").await;
     jcode_base::logging::warn(
-        "OpenAI opaque websocket rejection before response: one full-request HTTPS recovery",
+        "OpenAI opaque websocket rejection before response: full-request HTTPS recovery",
     );
-    let (recovery_tx, mut recovery_rx) = mpsc::channel(100);
-    let recovery = stream_response(
-        jcode_provider_core::fresh_transport_client(),
-        credentials,
-        account_label,
-        request,
-        "https recovery: opaque websocket rejection".into(),
-        recovery_tx,
-    );
-    tokio::pin!(recovery);
-    let mut failed = false;
-    let mut failure_detail = None;
-    let mut retry_after_secs = None;
-    let mut finished = false;
-    loop {
-        tokio::select! {
-            _ = tx.closed() => return,
-            result = &mut recovery, if !finished => {
-                if let Err(error) = result {
-                    failed = true;
-                    failure_detail = Some(match error {
-                        OpenAIStreamFailure::Other(error) | OpenAIStreamFailure::FallbackToHttps(error) => format!("{error:#}"),
-                        OpenAIStreamFailure::OpaqueWsRejection => "invalid_request_error: Invalid request".into(),
-                    });
-                }
-                finished = true;
-            }
-            event = recovery_rx.recv() => match event {
-                Some(Ok(StreamEvent::Error { message, retry_after_secs: retry_after })) => {
-                    failed = true;
-                    failure_detail = Some(message);
-                    retry_after_secs = retry_after;
-                    break;
+    let mut next_retry_delay = None;
+    let mut credential_refresh_retried = false;
+    for attempt in retry_policy.attempts() {
+        if tx.is_closed() {
+            return;
+        }
+        if attempt > 0 {
+            emit_connection_phase(
+                tx,
+                jcode_message_types::ConnectionPhase::Retrying {
+                    attempt: attempt.saturating_add(1),
+                    max: max_attempts,
                 },
-                Some(Err(error)) => {
-                    failed = true;
-                    failure_detail = Some(error.to_string());
-                    break;
-                },
-                Some(event) => { if tx.send(event).await.is_err() { return; } }
-                None => break,
+            )
+            .await;
+            if while_consumer_open(
+                tx,
+                tokio::time::sleep(retry_policy.delay(
+                    attempt,
+                    RETRY_BASE_DELAY_MS,
+                    next_retry_delay.take(),
+                )),
+            )
+            .await
+            .is_none()
+            {
+                return;
             }
         }
-    }
-    jcode_base::logging::info(&format!(
-        "OpenAI opaque websocket HTTPS recovery finished: success={} failure={}",
-        !failed,
-        failure_detail.as_deref().unwrap_or("none")
-    ));
-    if failed {
+        let (attempt_tx, attempt_guard) =
+            jcode_provider_core::attempt_tracker::track_attempt_output(tx.clone());
+        let (recovery_tx, mut recovery_rx) = mpsc::channel(100);
+        let recovery = stream_response(
+            jcode_provider_core::fresh_transport_client(),
+            Arc::clone(&credentials),
+            account_label.clone(),
+            request.clone(),
+            "https recovery: opaque websocket rejection".into(),
+            recovery_tx,
+        );
+        tokio::pin!(recovery);
+        let mut failure_detail = None;
+        let mut retry_after_secs = None;
+        let mut finished = false;
+        let mut events_drained = false;
+        loop {
+            tokio::select! {
+                _ = tx.closed() => return,
+                result = &mut recovery, if !finished => {
+                    if let Err(error) = result {
+                        failure_detail = Some(match error {
+                            OpenAIStreamFailure::Other(error) | OpenAIStreamFailure::FallbackToHttps(error) => {
+                                next_retry_delay = jcode_provider_core::retry_after::retry_after_from_error(&error);
+                                format!("{error:#}")
+                            },
+                            OpenAIStreamFailure::OpaqueWsRejection => "invalid_request_error: Invalid request".into(),
+                        });
+                    }
+                    finished = true;
+                }
+                event = recovery_rx.recv(), if !events_drained => match event {
+                    Some(Ok(StreamEvent::Error { message, retry_after_secs: retry_after })) => {
+                        failure_detail = Some(message);
+                        retry_after_secs = retry_after;
+                        next_retry_delay = retry_after.map(Duration::from_secs);
+                        break;
+                    },
+                    Some(Err(error)) => {
+                        next_retry_delay = jcode_provider_core::retry_after::retry_after_from_error(&error);
+                        failure_detail = Some(format!("{error:#}"));
+                        break;
+                    },
+                    Some(event) => { if attempt_tx.send(event).await.is_err() { return; } }
+                    None => events_drained = true,
+                }
+            }
+            if finished && events_drained {
+                break;
+            }
+        }
+        drop(attempt_tx);
+        let saw_output = attempt_guard.finish().await;
+        let Some(mut failure_detail) = failure_detail else {
+            return;
+        };
+        let mut lower = failure_detail.to_lowercase();
+        let refreshed_credentials = lower.contains("openai token refreshed, retrying");
+        if refreshed_credentials && credential_refresh_retried {
+            failure_detail =
+                "OpenAI rejected refreshed credentials; run /login to re-authenticate".into();
+            lower = failure_detail.to_lowercase();
+        }
+        if super::openai_provider_impl::is_retryable_openai_request_error(&lower)
+            && retry_policy.can_retry(attempt)
+        {
+            credential_refresh_retried |= refreshed_credentials;
+            if saw_output {
+                let _ = tx
+                    .send(Ok(StreamEvent::RetryRollback {
+                        attempt: attempt.saturating_add(2),
+                        max: max_attempts,
+                    }))
+                    .await;
+            }
+            continue;
+        }
         emit_status_detail(tx, "opaque websocket rejection: HTTPS recovery failed").await;
-        let _ = tx
-            .send(Ok(StreamEvent::Error {
-                message: format!(
-                    "invalid_request_error: Invalid request; HTTPS recovery failed: {}",
-                    failure_detail.as_deref().unwrap_or("unknown failure")
-                ),
-                retry_after_secs,
-            }))
-            .await;
+        let _ = tx.send(Ok(StreamEvent::Error {
+            message: format!(
+                "invalid_request_error: Invalid request; HTTPS recovery failed: {failure_detail}"
+            ),
+            retry_after_secs,
+        })).await;
+        return;
     }
 }
 

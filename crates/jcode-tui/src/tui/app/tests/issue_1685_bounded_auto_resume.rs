@@ -1,10 +1,9 @@
-// Issue #1685: rate-limit and provider connection auto-resumes must be
-// bounded per turn, then pause with the draft restored.
+// Retryable provider failures remain held until success or explicit cancellation.
 
 fn issue_1685_user_turn(
     content: &str,
     auto_retry: bool,
-    retry_attempts: u8,
+    retry_attempts: u32,
 ) -> PendingRemoteMessage {
     PendingRemoteMessage {
         content: content.to_string(),
@@ -60,94 +59,91 @@ fn issue_1685_openference_json_rate_limit_uses_retry_after_seconds_not_max_rpm()
 }
 
 #[test]
-fn issue_1685_stale_rate_limit_stops_after_bounded_resumes() {
+fn rate_limit_resumes_continue_beyond_old_attempt_limit() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
-    app.auto_poke_incomplete_todos = true;
     app.rate_limit_pending_message = Some(issue_1685_user_turn("continue the adapter", false, 0));
-    let error = "429 Too Many Requests: rate limit exceeded, retry after 30 seconds";
-
-    for attempt in 1..=App::AUTO_RETRY_MAX_ATTEMPTS {
-        app.last_submitted_input = Some("continue the adapter".to_string());
+    for attempt in 1..=300_u32 {
         app.is_processing = true;
         app.handle_server_event(
-            issue_1685_error(u64::from(attempt), error, None),
+            issue_1685_error(
+                u64::from(attempt),
+                "429 Too Many Requests: retry after 30 seconds",
+                None,
+            ),
             &mut remote,
         );
-        let pending = app
-            .rate_limit_pending_message
-            .as_ref()
-            .expect("held within budget");
-        assert_eq!(pending.retry_attempts, attempt);
+        assert_eq!(
+            app.rate_limit_pending_message
+                .as_ref()
+                .unwrap()
+                .retry_attempts,
+            attempt
+        );
         assert!(app.rate_limit_reset.is_some());
+        assert!(!app.is_processing);
     }
-
-    app.is_processing = true;
-    app.handle_server_event(issue_1685_error(99, error, None), &mut remote);
-    assert!(
-        app.rate_limit_pending_message.is_none(),
-        "no further automatic resend"
-    );
+    crate::tui::app::commands::handle_cancel_command(&mut app, "/cancel");
+    assert!(app.rate_limit_pending_message.is_none());
     assert!(app.rate_limit_reset.is_none());
-    assert!(
-        !app.auto_poke_incomplete_todos,
-        "auto-poke must not restart the loop"
-    );
-    assert_eq!(app.input, "continue the adapter");
-    assert!(
-        app.display_messages()
-            .iter()
-            .any(|m| m.content.contains("Rate-limit retry limit reached"))
-    );
 }
 
 #[test]
-fn issue_1685_provider_dns_failure_has_bounded_resumes() {
+fn provider_dns_resumes_keep_bounded_delay_beyond_old_limit() {
     let mut app = create_test_app();
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     let mut remote = crate::tui::backend::RemoteConnection::dummy();
-    app.auto_poke_incomplete_todos = true;
-    app.auto_poke_default_on = true;
     app.rate_limit_pending_message = Some(issue_1685_user_turn("continue the adapter", false, 0));
-    let error = "Failed to send OpenAI-compatible chat request: client error (Connect): dns error: failed to lookup address information: nodename nor servname provided, or not known";
-
-    for attempt in 1..=App::AUTO_RETRY_MAX_ATTEMPTS {
-        app.last_submitted_input = Some("continue the adapter".to_string());
+    let error = "Failed to send request to OpenAI API: client error (Connect): dns error";
+    for attempt in 1..=300_u32 {
         app.is_processing = true;
         app.handle_server_event(
             issue_1685_error(u64::from(attempt), error, None),
             &mut remote,
         );
-        let pending = app
-            .rate_limit_pending_message
-            .as_ref()
-            .expect("held within budget");
+        let pending = app.rate_limit_pending_message.as_ref().unwrap();
         assert_eq!(pending.retry_attempts, attempt);
+        assert!(pending.auto_retry);
         assert!(matches!(
             app.status,
             ProcessingStatus::WaitingForNetwork { .. }
         ));
-        let wait = app
-            .rate_limit_reset
-            .unwrap()
-            .saturating_duration_since(std::time::Instant::now());
-        assert!(wait <= std::time::Duration::from_secs(5 * u64::from(attempt)));
+        assert!(
+            app.rate_limit_reset
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now())
+                <= std::time::Duration::from_secs(App::AUTO_RETRY_BACKOFF_CAP_SECS)
+        );
     }
+}
 
-    app.is_processing = true;
-    app.handle_server_event(issue_1685_error(99, error, None), &mut remote);
-    assert!(app.rate_limit_pending_message.is_none());
-    assert!(app.rate_limit_reset.is_none());
-    assert!(!app.auto_poke_incomplete_todos);
-    assert!(!app.auto_poke_default_on);
-    assert_eq!(app.input, "continue the adapter");
+#[test]
+fn remote_retry_attempt_counter_saturates_without_stopping() {
+    let mut app = create_test_app();
+    app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", true, u32::MAX));
+    for _ in 0..2 {
+        assert!(app.schedule_pending_remote_retry("temporary server failure"));
+        assert_eq!(
+            app.rate_limit_pending_message
+                .as_ref()
+                .unwrap()
+                .retry_attempts,
+            u32::MAX
+        );
+        assert!(
+            app.rate_limit_reset
+                .unwrap()
+                .saturating_duration_since(std::time::Instant::now())
+                <= std::time::Duration::from_secs(App::AUTO_RETRY_BACKOFF_CAP_SECS)
+        );
+    }
     assert!(
-        app.display_messages()
+        !app.display_messages()
             .iter()
-            .any(|m| m.content.contains("Connection retry limit reached"))
+            .any(|m| m.content.contains("/0"))
     );
 }
 
@@ -184,6 +180,114 @@ fn wifi_roam_http2_stream_error_waits_for_network_instead_of_offering_model_swit
 }
 
 #[test]
+fn retryable_provider_errors_retain_user_turn_without_auto_poke() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    for error in [
+        "OpenAI API error 500 Internal Server Error: server_error",
+        "Anthropic API error 529: overloaded_error",
+        "Gemini request failed with status 503 Service Unavailable",
+        "Gemini request failed with status 503: billing service temporarily unavailable",
+        "OpenAI API error 507: exceeded request buffer limit while retrying upstream",
+    ] {
+        let mut app = create_test_app();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        app.auto_poke_incomplete_todos = false;
+        app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", false, 100));
+        app.is_processing = true;
+        app.handle_server_event(issue_1685_error(42, error, None), &mut remote);
+        let pending = app
+            .rate_limit_pending_message
+            .as_ref()
+            .expect("retryable user intent retained");
+        assert!(pending.auto_retry, "{error}");
+        assert_eq!(pending.retry_attempts, 101);
+        assert!(app.rate_limit_reset.is_some());
+    }
+}
+
+#[test]
+fn permanent_http_status_overrides_retryable_words_in_error_body() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    for error in [
+        "OpenAI API error 401 Unauthorized: request timeout; retry after 30 seconds",
+        "Anthropic API error 403 Forbidden: connection reset",
+        "OpenAI API error 400 Bad Request: response mentions status 503 Service Unavailable",
+    ] {
+        let mut app = create_test_app();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        app.last_submitted_input = Some("keep going".into());
+        app.rate_limit_pending_message = Some(issue_1685_user_turn("keep going", true, 100));
+        app.is_processing = true;
+        app.handle_server_event(issue_1685_error(42, error, None), &mut remote);
+        assert!(!app.is_processing, "{error}");
+        assert!(app.rate_limit_pending_message.is_none(), "{error}");
+        assert!(app.rate_limit_reset.is_none(), "{error}");
+        assert_eq!(app.input, "keep going", "{error}");
+    }
+}
+
+#[test]
+fn unsafe_external_agent_outcomes_do_not_replay_even_without_text() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    for (provider, error) in [
+        (
+            "openai",
+            "HTTP 503 Service Unavailable: unsafe to replay accepted operation",
+        ),
+        (
+            "openai",
+            "HTTP 503 Service Unavailable: Do not retry this operation",
+        ),
+        (
+            "cursor",
+            "Cursor agent stream timed out waiting for meaningful progress",
+        ),
+        ("cursor", "connection reset"),
+    ] {
+        let mut app = create_test_app();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        app.remote_provider_name = Some(provider.into());
+        app.last_submitted_input = Some("run the tool".into());
+        app.rate_limit_pending_message = Some(issue_1685_user_turn("run the tool", true, 100));
+        app.is_processing = true;
+        app.handle_server_event(issue_1685_error(42, error, None), &mut remote);
+        assert!(app.rate_limit_pending_message.is_none(), "{error}");
+        assert!(app.rate_limit_reset.is_none(), "{error}");
+        assert_eq!(app.input, "run the tool");
+    }
+}
+
+#[test]
+fn cursor_pre_dispatch_connect_failure_keeps_retrying() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let _guard = rt.enter();
+    let mut app = create_test_app();
+    let mut remote = crate::tui::backend::RemoteConnection::dummy();
+    app.remote_provider_name = Some("cursor".into());
+    app.rate_limit_pending_message = Some(issue_1685_user_turn("run the tool", false, 100));
+    app.is_processing = true;
+    app.handle_server_event(
+        issue_1685_error(
+            42,
+            "Failed to connect to agent.example:443: dns error",
+            None,
+        ),
+        &mut remote,
+    );
+    assert_eq!(
+        app.rate_limit_pending_message
+            .as_ref()
+            .unwrap()
+            .retry_attempts,
+        101
+    );
+    assert!(app.rate_limit_reset.is_some());
+}
+
+#[test]
 fn issue_1685_offline_probes_do_not_consume_retry_budget() {
     let mut app = create_test_app();
     app.rate_limit_pending_message = Some(issue_1685_user_turn("continue", true, 2));
@@ -200,35 +304,29 @@ fn issue_1685_offline_probes_do_not_consume_retry_budget() {
 }
 
 #[test]
-fn accepted_stream_timeouts_do_not_restart_provider_retry_budget() {
+fn accepted_stream_timeouts_keep_retryable_turn_held() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let _guard = rt.enter();
     for error in [
         "Stream read timeout: no data received for 180 seconds",
-        "Failed after 3 retries: WebSocket stream timed out waiting for next websocket activity (1s; response_id=resp_test elapsed_ms=181701 since_last_activity_ms=180043)",
+        "WebSocket stream timed out waiting for next websocket activity (1s)",
         "timed out waiting for next websocket activity on persistent WS (180s)",
     ] {
         for auto_retry in [false, true] {
             let mut app = create_test_app();
             let mut remote = crate::tui::backend::RemoteConnection::dummy();
-            app.auto_poke_incomplete_todos = true;
-            app.auto_poke_default_on = true;
-            app.last_submitted_input = Some("keep going".to_string());
             app.rate_limit_pending_message =
-                Some(issue_1685_user_turn("keep going", auto_retry, 0));
+                Some(issue_1685_user_turn("keep going", auto_retry, 500));
             app.is_processing = true;
-
             app.handle_server_event(issue_1685_error(42, error, None), &mut remote);
-
             assert!(!app.is_processing, "{error}");
-            assert!(app.rate_limit_pending_message.is_none(), "{error}");
-            assert!(app.rate_limit_reset.is_none(), "{error}");
-            assert!(!app.auto_poke_incomplete_todos, "{error}");
-            assert!(!app.auto_poke_default_on, "{error}");
-            assert_eq!(app.input, "keep going", "{error}");
-            assert!(app.display_messages().iter().any(|message| {
-                message.content.contains("provider stream stalled")
-            }), "{error}");
+            let pending = app
+                .rate_limit_pending_message
+                .as_ref()
+                .expect("retryable stream held");
+            assert!(pending.auto_retry);
+            assert_eq!(pending.retry_attempts, 501);
+            assert!(app.rate_limit_reset.is_some());
         }
     }
 }

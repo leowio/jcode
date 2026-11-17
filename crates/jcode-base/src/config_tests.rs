@@ -15,6 +15,22 @@ fn restore_env_var(key: &str, previous: Option<OsString>) {
 }
 
 #[test]
+fn provider_retry_budget_defaults_to_unlimited_and_accepts_zero_override() {
+    let _lock = crate::storage::lock_test_env();
+    let key = "JCODE_MAX_RETRIES";
+    let previous = std::env::var_os(key);
+    assert_eq!(ProviderConfig::default().max_retries, 0);
+    for (value, expected) in [("0", 0), (" 0 ", 0), ("3", 3), ("invalid", 3)] {
+        crate::env::set_var(key, value);
+        let mut config = Config::default();
+        config.provider.max_retries = 3;
+        config.apply_env_overrides();
+        assert_eq!(config.provider.max_retries, expected, "{value}");
+    }
+    restore_env_var(key, previous);
+}
+
+#[test]
 fn hibernation_environment_override_accepts_seconds_and_zero_but_not_invalid_values() {
     let _lock = crate::storage::lock_test_env();
     let key = "JCODE_HIBERNATION_IDLE_SECS";

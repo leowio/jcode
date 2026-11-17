@@ -2041,6 +2041,7 @@ async fn handle_debug_command(app: &mut App, cmd: &str, remote: &mut RemoteConne
     if cmd == "state" {
         return serde_json::json!({
             "processing": app.is_processing,
+            "auto_poke_enabled": app.auto_poke_incomplete_todos,
             "processing_status": format!("{:?}", app.status),
             "current_message_id": app.current_message_id,
             "pending_soft_interrupts": app.pending_soft_interrupts.len(),
@@ -2367,3 +2368,7 @@ fn handle_disconnected_key_internal(
 #[cfg(test)]
 #[path = "remote_stall_guard_tests.rs"]
 mod stall_guard_tests;
+
+#[cfg(test)]
+#[path = "remote_auto_poke_env_tests.rs"]
+mod auto_poke_env_tests;

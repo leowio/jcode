@@ -12,6 +12,30 @@ fn catalog_error_is_auth_rejection(err: &anyhow::Error) -> bool {
         .is_some_and(|status| status.0 == 401 || status.0 == 403)
 }
 
+/// Preserve the underlying transport cause when classifying an anyhow chain.
+/// The upstream request-buffer 507 is transient; ordinary storage failures are
+/// not made retryable by the status code alone.
+pub(super) fn is_retryable_openai_request_error(error: &str) -> bool {
+    let refreshed_credentials = error.contains("openai token refreshed, retrying")
+        || error.contains("openai credentials changed before request, retrying");
+    if refreshed_credentials {
+        return true;
+    }
+    if error.contains("401 unauthorized")
+        || error.contains("403 forbidden")
+        || error.contains("invalid api key")
+        || error.contains("invalid_api_key")
+        || error.contains("insufficient_quota")
+        || error.contains("no refresh token is available")
+        || error.contains("openai rejected refreshed credentials")
+    {
+        return false;
+    }
+    is_retryable_error(error)
+        || (error.contains("507 insufficient storage")
+            && error.contains("exceeded request buffer limit while retrying upstream"))
+}
+
 #[async_trait]
 impl Provider for OpenAIProvider {
     fn set_session_id(&self, session_id: &str) {
@@ -315,6 +339,20 @@ impl Provider for OpenAIProvider {
             self.diagnostic_state_summary()
         ));
 
+        // Zero means unlimited retries. Resolve the shared provider policy once
+        // for this request so in-flight retries keep a consistent budget.
+        let config = jcode_base::config::config();
+        let provider_config = &config.provider;
+        let max_attempts = provider_config.max_retries;
+        let attempt_limit = if max_attempts == 0 {
+            "unlimited".to_string()
+        } else {
+            max_attempts.to_string()
+        };
+        let retry_policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+            max_attempts,
+            provider_config.retry_backoff_cap_secs,
+        );
         let (tx, rx) = mpsc::channel::<Result<StreamEvent>>(100);
 
         let credentials = Arc::clone(&self.credentials);
@@ -362,6 +400,8 @@ impl Provider for OpenAIProvider {
                                 account_label.clone(),
                                 request.clone(),
                                 &tx,
+                                retry_policy,
+                                max_attempts,
                             )
                             .await;
                             return;
@@ -419,7 +459,7 @@ impl Provider for OpenAIProvider {
                                 let _ = tx
                                     .send(Ok(StreamEvent::RetryRollback {
                                         attempt: 1,
-                                        max: MAX_RETRIES,
+                                        max: max_attempts,
                                     }))
                                     .await;
                             }
@@ -435,8 +475,9 @@ impl Provider for OpenAIProvider {
                 let mut force_https_for_request = false;
                 let mut skip_backoff_once = false;
                 let mut next_retry_delay = None;
+                let mut credential_refresh_retried = false;
 
-                for attempt in 0..MAX_RETRIES {
+                for attempt in retry_policy.attempts() {
                     if tx.is_closed() {
                         return;
                     }
@@ -444,14 +485,14 @@ impl Provider for OpenAIProvider {
                         emit_connection_phase(
                             &tx,
                             jcode_message_types::ConnectionPhase::Retrying {
-                                attempt: attempt + 1,
-                                max: MAX_RETRIES,
+                                attempt: attempt.saturating_add(1),
+                                max: max_attempts,
                             },
                         )
                         .await;
                     }
                     if attempt > 0 && !skip_backoff_once {
-                        let delay = jcode_provider_core::retry_after::retry_delay(
+                        let delay = retry_policy.delay(
                             attempt,
                             RETRY_BASE_DELAY_MS,
                             next_retry_delay.take(),
@@ -464,8 +505,8 @@ impl Provider for OpenAIProvider {
                         }
                         jcode_base::logging::info(&format!(
                             "Retrying OpenAI API request (attempt {}/{})",
-                            attempt + 1,
-                            MAX_RETRIES
+                            attempt.saturating_add(1),
+                            attempt_limit
                         ));
                     }
                     skip_backoff_once = false;
@@ -513,8 +554,8 @@ impl Provider for OpenAIProvider {
                         "attempt_start",
                         vec![
                             ("model", model_for_transport.clone()),
-                            ("attempt", (attempt + 1).to_string()),
-                            ("max_attempts", MAX_RETRIES.to_string()),
+                            ("attempt", (attempt.saturating_add(1)).to_string()),
+                            ("max_attempts", max_attempts.to_string()),
                             ("transport", transport_label.to_string()),
                             ("transport_mode", transport_mode.as_str().to_string()),
                             ("forced_https", force_https_for_request.to_string()),
@@ -522,8 +563,8 @@ impl Provider for OpenAIProvider {
                     );
                     jcode_base::logging::info(&format!(
                         "OpenAI stream attempt {}/{} using transport '{}'; model='{}'; mode='{}'",
-                        attempt + 1,
-                        MAX_RETRIES,
+                        attempt.saturating_add(1),
+                        attempt_limit,
                         transport_label,
                         model_for_transport,
                         transport_mode.as_str()
@@ -599,6 +640,8 @@ impl Provider for OpenAIProvider {
                                 account_label.clone(),
                                 request.clone(),
                                 &tx,
+                                retry_policy,
+                                max_attempts,
                             )
                             .await;
                             return;
@@ -609,7 +652,7 @@ impl Provider for OpenAIProvider {
                                 "attempt_success",
                                 vec![
                                     ("model", model_for_transport.clone()),
-                                    ("attempt", (attempt + 1).to_string()),
+                                    ("attempt", (attempt.saturating_add(1)).to_string()),
                                     ("transport", transport_label.to_string()),
                                     (
                                         "elapsed_ms",
@@ -637,7 +680,7 @@ impl Provider for OpenAIProvider {
                                 "fallback_to_https",
                                 vec![
                                     ("model", model_for_transport.clone()),
-                                    ("attempt", (attempt + 1).to_string()),
+                                    ("attempt", (attempt.saturating_add(1)).to_string()),
                                     ("transport", transport_label.to_string()),
                                     ("reason", reason.to_string()),
                                     ("fallback_reason", fallback_reason.summary().to_string()),
@@ -656,8 +699,8 @@ impl Provider for OpenAIProvider {
                                 // duplicating.
                                 let _ = tx
                                     .send(Ok(StreamEvent::RetryRollback {
-                                        attempt: attempt + 2,
-                                        max: MAX_RETRIES,
+                                        attempt: attempt.saturating_add(2),
+                                        max: max_attempts,
                                     }))
                                     .await;
                             }
@@ -689,15 +732,28 @@ impl Provider for OpenAIProvider {
                             last_error = Some(error);
                             continue;
                         }
-                        Err(OpenAIStreamFailure::Other(error)) => {
+                        Err(OpenAIStreamFailure::Other(mut error)) => {
                             let overload_notice = retry_diagnostics.record(&format!("{error:#}"));
                             let elapsed_ms = attempt_started.elapsed().as_millis();
                             // Full anyhow chain ({:#}) so a send-level transport
                             // cause wrapped behind `.context("Failed to send
                             // request to OpenAI API")` (e.g. TLS BadRecordMac) is
                             // visible to the retry classifier.
-                            let error_str = format!("{error:#}").to_lowercase();
-                            if is_retryable_error(&error_str) && attempt + 1 < MAX_RETRIES {
+                            let mut error_str = format!("{error:#}").to_lowercase();
+                            let refreshed_credentials =
+                                error_str.contains("openai token refreshed, retrying");
+                            if refreshed_credentials && credential_refresh_retried {
+                                // Token refresh is a recovery step, not an
+                                // unlimited retry of permanently rejected auth.
+                                error = anyhow::anyhow!(
+                                    "OpenAI rejected refreshed credentials; run /login to re-authenticate"
+                                );
+                                error_str = error.to_string().to_lowercase();
+                            }
+                            if is_retryable_openai_request_error(&error_str)
+                                && retry_policy.can_retry(attempt)
+                            {
+                                credential_refresh_retried |= refreshed_credentials;
                                 if saw_output {
                                     // Partial output already reached the
                                     // consumer; roll it back so the retried
@@ -705,8 +761,8 @@ impl Provider for OpenAIProvider {
                                     // duplicating.
                                     let _ = tx
                                         .send(Ok(StreamEvent::RetryRollback {
-                                            attempt: attempt + 2,
-                                            max: MAX_RETRIES,
+                                            attempt: attempt.saturating_add(2),
+                                            max: max_attempts,
                                         }))
                                         .await;
                                 }
@@ -715,8 +771,8 @@ impl Provider for OpenAIProvider {
                                     "retry_scheduled",
                                     vec![
                                         ("model", model_for_transport.clone()),
-                                        ("attempt", (attempt + 1).to_string()),
-                                        ("next_attempt", (attempt + 2).to_string()),
+                                        ("attempt", (attempt.saturating_add(1)).to_string()),
+                                        ("next_attempt", (attempt.saturating_add(2)).to_string()),
                                         ("transport", transport_label.to_string()),
                                         ("error", error.to_string()),
                                         ("elapsed_ms", elapsed_ms.to_string()),
@@ -743,7 +799,7 @@ impl Provider for OpenAIProvider {
                                 "attempt_failed",
                                 vec![
                                     ("model", model_for_transport.clone()),
-                                    ("attempt", (attempt + 1).to_string()),
+                                    ("attempt", (attempt.saturating_add(1)).to_string()),
                                     ("transport", transport_label.to_string()),
                                     ("will_retry", "false".to_string()),
                                     ("error", error.to_string()),
@@ -787,14 +843,14 @@ impl Provider for OpenAIProvider {
                         "retries_exhausted",
                         vec![
                             ("model", model_for_transport.clone()),
-                            ("max_attempts", MAX_RETRIES.to_string()),
+                            ("max_attempts", max_attempts.to_string()),
                             ("error", e.to_string()),
                         ],
                     );
                     let _ = tx
                         .send(Err(retry_diagnostics.annotate(anyhow::anyhow!(
                             "Failed after {} retries: {}",
-                            MAX_RETRIES,
+                            max_attempts,
                             e
                         ))))
                         .await;

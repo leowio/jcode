@@ -795,3 +795,122 @@ async fn bedrock_live_smoke_test() {
         .expect("live Bedrock completion");
     assert!(output.to_ascii_lowercase().contains("bedrock ok"));
 }
+
+#[test]
+fn transient_retry_classification_preserves_permanent_aws_failures() {
+    for error in [
+        "ThrottlingException: Too many requests",
+        "ServiceUnavailableException",
+        "InternalServerException",
+        "ModelTimeoutException",
+        "ModelNotReadyException",
+        "dispatch failure: connection reset by peer",
+    ] {
+        assert!(retryable_bedrock_failure(error), "{error}");
+    }
+    for error in [
+        "AccessDeniedException: please retry later",
+        "ValidationException: timeout value was invalid",
+        "ResourceNotFoundException",
+        "ExpiredTokenException",
+    ] {
+        assert!(!retryable_bedrock_failure(error), "{error}");
+    }
+}
+
+#[cfg(feature = "aws-sdk")]
+#[test]
+fn converse_sdk_retries_transient_failures_beyond_previous_budgets() {
+    use futures::StreamExt;
+    use std::io::{BufRead, Read, Write};
+    let _guard = lock_test_env();
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set("JCODE_HOME", home.path().to_str().unwrap());
+    let _retry = EnvVarGuard::set("JCODE_MAX_RETRIES", "0");
+    let _cap = EnvVarGuard::set("JCODE_RETRY_BACKOFF_CAP_SECS", "1");
+    let _sdk_attempts = EnvVarGuard::set("AWS_MAX_ATTEMPTS", "1");
+    let _region = EnvVarGuard::set("AWS_REGION", "us-east-1");
+    let _access = EnvVarGuard::set("AWS_ACCESS_KEY_ID", "synthetic-test-key");
+    let _secret = EnvVarGuard::set("AWS_SECRET_ACCESS_KEY", "synthetic-test-secret");
+    let _metadata = EnvVarGuard::set("AWS_EC2_METADATA_DISABLED", "true");
+    let _model = EnvVarGuard::set("JCODE_BEDROCK_MODEL", "amazon.nova-pro-v1:0");
+    let _sts = EnvVarGuard::remove("JCODE_BEDROCK_VALIDATE_STS");
+    let _profile = EnvVarGuard::remove("JCODE_BEDROCK_PROFILE");
+    let _aws_profile = EnvVarGuard::remove("AWS_PROFILE");
+    let _bearer = EnvVarGuard::remove("AWS_BEARER_TOKEN_BEDROCK");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let _endpoint = EnvVarGuard::set("AWS_ENDPOINT_URL", &endpoint);
+    let _runtime_endpoint = EnvVarGuard::set("AWS_ENDPOINT_URL_BEDROCK_RUNTIME", &endpoint);
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(12);
+        for index in 0..11 {
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "SDK retry did not arrive"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            let mut length = 0;
+            loop {
+                let mut line = String::new();
+                assert!(reader.read_line(&mut line).unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    length = value.trim().parse::<usize>().unwrap();
+                }
+            }
+            reader.read_exact(&mut vec![0; length]).unwrap();
+            drop(reader);
+            let (status, kind) = if index < 10 {
+                (503, "ServiceUnavailableException")
+            } else {
+                (400, "ValidationException")
+            };
+            let body = format!("{{\"__type\":\"{kind}\",\"message\":\"synthetic fixture\"}}");
+            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nx-amzn-ErrorType: {kind}\r\nRetry-After: 0\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+    });
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let provider = BedrockProvider::new();
+            let mut stream = provider
+                .complete(&[JMessage::user("fixture")], &[], "", None)
+                .await
+                .unwrap();
+            let error = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+                while let Some(event) = stream.next().await {
+                    if let Err(error) = event {
+                        return error;
+                    }
+                }
+                panic!("permanent fixture failure must surface");
+            })
+            .await
+            .unwrap();
+            assert!(
+                error
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("validation")
+            );
+        });
+    server.join().unwrap();
+}

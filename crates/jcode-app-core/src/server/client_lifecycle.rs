@@ -3518,10 +3518,20 @@ pub(super) async fn process_reserved_message_streaming_mpsc(
 ) -> Result<()> {
     agent.validate_server_turn(lease)?;
     let session_id = agent.session_id().to_string();
+    let start_message_index = agent.message_count();
     let result = agent
         .run_reserved_streaming_mpsc(lease, content, images, system_reminder, event_tx, None)
         .await;
     if result.is_ok() {
+        // Server-initiated continuations mark their lease to suppress feedback;
+        // a native worker report must not create another review of itself.
+        super::runtime_commands::after_completed_turn(
+            agent,
+            lease,
+            content,
+            start_message_index,
+        )
+        .await;
         crate::runtime_memory_log::emit_event(
             crate::runtime_memory_log::RuntimeMemoryLogEvent::new(
                 "turn_completed",

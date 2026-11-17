@@ -123,6 +123,7 @@ pub(super) async fn spawn_tracked_live_turn(
     let Ok(turn_lease) = agent.claim_server_turn() else {
         return false;
     };
+    super::runtime_commands::skip_feedback_for_turn(&turn_lease);
     if swarm
         .members
         .read()

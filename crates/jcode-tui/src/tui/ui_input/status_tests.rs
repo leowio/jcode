@@ -1,4 +1,19 @@
 use super::*;
+
+#[test]
+fn unlimited_provider_retry_label_has_no_finite_denominator() {
+    assert_eq!(
+        connection_phase_label(&ConnectionPhase::Retrying {
+            attempt: 12,
+            max: 0
+        }),
+        "retrying 12"
+    );
+    assert_eq!(
+        connection_phase_label(&ConnectionPhase::Retrying { attempt: 2, max: 3 }),
+        "retrying 2/3"
+    );
+}
 use ratatui::style::Modifier;
 
 fn background_row(

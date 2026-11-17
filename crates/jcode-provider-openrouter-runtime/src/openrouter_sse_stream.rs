@@ -72,30 +72,38 @@ pub(super) async fn run_stream_with_retries(
     let mut last_error = None;
     let mut next_retry_delay = None;
     let config = jcode_base::config::config();
-    let max_retries = config.provider.max_retries.max(1);
-    let retry_backoff_cap =
-        std::time::Duration::from_secs(config.provider.retry_backoff_cap_secs.max(1));
+    let max_retries = config.provider.max_retries;
+    let retry_policy = jcode_provider_core::retry_policy::RetryPolicy::new(
+        max_retries,
+        config.provider.retry_backoff_cap_secs,
+    );
 
-    for attempt in 0..max_retries {
+    for attempt in retry_policy.attempts() {
+        if tx.is_closed() {
+            return;
+        }
         if attempt > 0 {
-            let delay = jcode_provider_core::retry_after::retry_delay(
-                attempt,
-                RETRY_BASE_DELAY_MS,
-                next_retry_delay.take(),
+            let delay = retry_policy.delay(attempt, RETRY_BASE_DELAY_MS, next_retry_delay.take());
+            if jcode_provider_core::retry_policy::while_consumer_open(
+                &tx,
+                tokio::time::sleep(delay),
             )
-            .min(retry_backoff_cap);
-            tokio::time::sleep(delay).await;
+            .await
+            .is_none()
+            {
+                return;
+            }
             jcode_base::logging::info(&format!(
                 "Retrying API request using {} (attempt {}/{})",
                 auth.label(),
-                attempt + 1,
+                attempt.saturating_add(1),
                 max_retries
             ));
         }
 
         jcode_base::logging::info(&format!(
             "API stream attempt {}/{} over HTTPS transport (model: {}, endpoint: {}, auth: {})",
-            attempt + 1,
+            attempt.saturating_add(1),
             max_retries,
             model,
             api_base,
@@ -119,21 +127,27 @@ pub(super) async fn run_stream_with_retries(
             jcode_provider_core::fresh_transport_client()
         };
 
-        match stream_response(
-            attempt_client,
-            api_base.clone(),
-            auth.clone(),
-            send_openrouter_headers,
-            &conversation_id,
-            request.clone(),
-            azure_responses,
-            attempt_tx,
-            Arc::clone(&provider_pin),
-            model.clone(),
-            responses_api,
+        let result = jcode_provider_core::retry_policy::while_consumer_open(
+            &tx,
+            stream_response(
+                attempt_client,
+                api_base.clone(),
+                auth.clone(),
+                send_openrouter_headers,
+                &conversation_id,
+                request.clone(),
+                azure_responses,
+                attempt_tx,
+                Arc::clone(&provider_pin),
+                model.clone(),
+                responses_api,
+            ),
         )
-        .await
-        {
+        .await;
+        let Some(result) = result else {
+            return;
+        };
+        match result {
             Ok(()) => {
                 let _ = attempt_guard.finish().await;
                 return;
@@ -142,7 +156,7 @@ pub(super) async fn run_stream_with_retries(
                 let saw_output = attempt_guard.finish().await;
                 // Full anyhow chain ({:#}) so a `.context(...)`-wrapped transport
                 // cause (e.g. TLS BadRecordMac) is visible to the classifier.
-                if retryable_stream_failure(&e) && attempt + 1 < max_retries {
+                if retryable_stream_failure(&e) && retry_policy.can_retry(attempt) {
                     if saw_output {
                         // Partial output already reached the consumer; tell it
                         // to discard the partial attempt so the retried
@@ -153,7 +167,7 @@ pub(super) async fn run_stream_with_retries(
                         ));
                         let _ = tx
                             .send(Ok(StreamEvent::RetryRollback {
-                                attempt: attempt + 2,
+                                attempt: attempt.saturating_add(2),
                                 max: max_retries,
                             }))
                             .await;
@@ -494,11 +508,9 @@ fn is_retryable_error(error_str: &str) -> bool {
     // burns time/credits. 429 (rate limit) is classified explicitly so it does
     // not depend on provider-specific body wording.
     match parsed_http_status(error_str) {
-        Some(400 | 401 | 402 | 403 | 404 | 405 | 406 | 422) => return false,
-        // 429 rate limit, and every 5xx: the server answered but is overloaded
-        // or failing on its side. This includes non-standard codes such as the
-        // 529 "overloaded" some OpenAI-compatible providers send (#1596).
-        Some(429 | 500..=599) => return true,
+        Some(501 | 505) => return false,
+        Some(408 | 429 | 500..=599) => return true,
+        Some(400..=499) => return false,
         _ => {}
     }
 
@@ -638,3 +650,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "unlimited_retry_tests.rs"]
+mod unlimited_retry_tests;

@@ -13,6 +13,7 @@ pub mod pricing;
 pub mod reasoning;
 pub mod request_compression;
 pub mod retry_after;
+pub mod retry_policy;
 pub mod selection;
 pub mod service_tier;
 pub mod transport;

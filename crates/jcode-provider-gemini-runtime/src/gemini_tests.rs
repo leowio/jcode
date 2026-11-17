@@ -834,6 +834,7 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
             "quota will reset after 0s",
             0,
             Some(Duration::from_secs(60)),
+            jcode_provider_core::retry_policy::RetryPolicy::new(5, 30),
         ),
         Some(Duration::from_secs(60))
     );
@@ -842,8 +843,9 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
             "generateContent",
             StatusCode::SERVICE_UNAVAILABLE,
             "No capacity available",
-            MAX_HTTP_RETRIES,
+            4,
             None,
+            jcode_provider_core::retry_policy::RetryPolicy::new(5, 30),
         )
         .is_none()
     );
@@ -855,6 +857,7 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
                 "",
                 0,
                 None,
+                jcode_provider_core::retry_policy::RetryPolicy::new(5, 30),
             )
             .is_none()
         );
@@ -867,6 +870,7 @@ fn http_retry_policy_honors_server_delay_and_stops_at_the_attempt_limit() {
                 "temporary failure",
                 0,
                 None,
+                jcode_provider_core::retry_policy::RetryPolicy::new(5, 30),
             )
             .is_some()
         );
@@ -890,6 +894,7 @@ fn http_retry_policy_does_not_replay_onboarding_or_persistent_quota_errors() {
                 body,
                 0,
                 Some(Duration::ZERO),
+                jcode_provider_core::retry_policy::RetryPolicy::new(5, 30),
             )
             .is_none(),
             "must not retry {body}"
@@ -902,6 +907,7 @@ fn http_retry_policy_does_not_replay_onboarding_or_persistent_quota_errors() {
             "backend unavailable",
             0,
             None,
+            jcode_provider_core::retry_policy::RetryPolicy::new(5, 30),
         )
         .is_none()
     );
@@ -937,6 +943,15 @@ fn runtime_state_key_changes_when_configured_project_or_auth_route_changes() {
 fn post_json_retries_transient_http_responses_against_local_server() {
     use std::io::{BufRead, Read, Write};
     let _guard = jcode_base::storage::lock_test_env();
+    struct ResetConfig;
+    impl Drop for ResetConfig {
+        fn drop(&mut self) {
+            jcode_base::config::invalidate_config_cache();
+        }
+    }
+    let _reset = ResetConfig;
+    let _retry = EnvVarGuard::set_value("JCODE_MAX_RETRIES", "0");
+    jcode_base::config::invalidate_config_cache();
     let home = tempfile::tempdir().unwrap();
     let _home = EnvVarGuard::set_path("JCODE_HOME", home.path());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -953,7 +968,14 @@ fn post_json_retries_transient_http_responses_against_local_server() {
     let server = std::thread::spawn(move || {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut requests = 0;
-        for status in ["429 Too Many Requests", "503 Service Unavailable", "200 OK"] {
+        for index in 0..11 {
+            let status = if index == 10 {
+                "200 OK"
+            } else if index % 2 == 0 {
+                "429 Too Many Requests"
+            } else {
+                "503 Service Unavailable"
+            };
             let mut stream = loop {
                 match listener.accept() {
                     Ok((stream, _)) => break stream,
@@ -989,7 +1011,7 @@ fn post_json_retries_transient_http_responses_against_local_server() {
                 json!({"probe": true})
             );
             requests += 1;
-            let body = if requests == 3 {
+            let body = if requests == 11 {
                 r#"{"ok":true}"#
             } else {
                 r#"{"error":{"message":"temporary failure"}}"#
@@ -1015,7 +1037,7 @@ fn post_json_retries_transient_http_responses_against_local_server() {
             .unwrap();
         assert_eq!(response, json!({"ok": true}));
     });
-    assert_eq!(server.join().unwrap(), 3);
+    assert_eq!(server.join().unwrap(), 11);
 }
 
 #[test]
@@ -1050,4 +1072,87 @@ fn ensure_state_replaces_oauth_cache_when_switching_to_api_key() {
             state.session_id
         );
     });
+}
+
+#[test]
+fn consumer_cancellation_closes_an_incomplete_http_response() {
+    use std::io::{BufRead, Read, Write};
+    let _lock = jcode_base::storage::lock_test_env();
+    struct ResetConfig;
+    impl Drop for ResetConfig {
+        fn drop(&mut self) {
+            jcode_base::config::invalidate_config_cache();
+        }
+    }
+    let _reset = ResetConfig;
+    let home = tempfile::tempdir().unwrap();
+    let _home = EnvVarGuard::set_path("JCODE_HOME", home.path());
+    let _key = EnvVarGuard::set_value("GEMINI_API_KEY", "synthetic-local-key");
+    let _oauth = EnvVarGuard::set_value("JCODE_GEMINI_FORCE_OAUTH", "false");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let _endpoint = EnvVarGuard::set_value("GEMINI_API_ENDPOINT", &endpoint);
+    jcode_base::config::invalidate_config_cache();
+    let (seen_tx, seen_rx) = tokio::sync::oneshot::channel();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(error) => panic!("accept: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = std::io::BufReader::new(&stream);
+        let mut length = 0;
+        loop {
+            let mut line = String::new();
+            assert!(reader.read_line(&mut line).unwrap() > 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                length = value.trim().parse::<usize>().unwrap();
+            }
+        }
+        let mut body = vec![0; length];
+        reader.read_exact(&mut body).unwrap();
+        drop(reader);
+        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9999\r\n\r\n{{\"response\":").unwrap();
+        seen_tx.send(()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_millis(600)))
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(
+            stream
+                .read(&mut byte)
+                .expect("cancel must close the in-flight HTTP body"),
+            0
+        );
+    });
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let mut provider = GeminiProvider::new();
+            provider.client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let stream = provider.complete(&[], &[], "fixture", None).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), seen_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            drop(stream);
+            tokio::task::spawn_blocking(move || server.join().unwrap())
+                .await
+                .unwrap();
+        });
 }

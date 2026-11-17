@@ -1,0 +1,54 @@
+{
+  "snapshot": "leowio-home-20261117",
+  "captured_at": "2026-11-17",
+  "purpose": "Source snapshot associated with the default Jcode executable installed on leowio-home.",
+  "version_output": "jcode v0.99.1-dev (unknown)",
+  "platform": "Linux x86_64",
+  "binary": {
+    "launcher": "~/.local/bin/jcode",
+    "launcher_target": "~/.jcode/builds/herdr-core-pr2058/jcode",
+    "active_binary": "/home/leowio/.local/share/jcode-system/bin/jcode-008a63c-system5-retry",
+    "sha256": "cb2146c2bb93d09aeb18a31a0d36540e9ca5b25e5bb907faf95bcefad22b845f",
+    "size_bytes": 370280376,
+    "installed_at": "2026-11-15T08:08:47.915316+00:00",
+    "gnu_build_id": "892e825113f2c9b15067b529352896fffb21b5b8"
+  },
+  "source": {
+    "build_staging_snapshot": "/tmp/jcode-indefinite-retry-20261115/native-source",
+    "recorded_durable_copy": "/home/leowio/.local/share/jcode-system/sources/008a63c-system5-retry",
+    "git_parent": "4510757a029d6638ff9d7ef8943f262ef8280ded",
+    "git_parent_reason": "Matching upstream ancestor; every file in this parent is present in the original build staging source.",
+    "recorded_retry_checkout_commit": "25e6b087cd9dadb712e6d9b71dec0f5cedffdef6",
+    "historical_build_label_base": "008a63c",
+    "file_count": 2956,
+    "file_manifest_sha256": "52f6042dd1fd37beff44aa708d344d3444f691ccea060cf65f765bfa4d30af42",
+    "file_manifest_format": "Sort lines of <Git file mode> <SHA-256 of file bytes or symlink target> <relative POSIX path>\\n; SHA-256 their UTF-8 concatenation. Exclude this receipt and .git, target, __pycache__ directories.",
+    "notes": [
+      "The durable copy has later local edits; the original build staging snapshot is preserved here.",
+      "The test-only file crates/jcode-tui/src/tui/app/tests/remote_failover_routes.rs was updated shortly after binary compilation and is included as saved."
+    ]
+  },
+  "build": {
+    "rust_toolchain": "1.98.1",
+    "profile": "dev",
+    "jobs": 6,
+    "command": "CARGO_BUILD_JOBS=6 cargo +1.98.1 build --locked --bin jcode",
+    "original_target_dir": "/home/leowio/code/tools/jcode-herdr-core-2058/target",
+    "notes": "This preserves source and build provenance. A new build from a Git checkout can embed different Git metadata; byte-identical output has not been asserted."
+  },
+  "launcher_policy": {
+    "JCODE_DISABLE_CLAUDE_MCP": "1",
+    "automatic_updates": "Launcher adds --no-update unless --no-update or --auto-update was explicitly supplied."
+  },
+  "native_extensions": [
+    "shared-project-store",
+    "daemon-review-and-judge",
+    "shared-openai-auth-with-single-flight-refresh",
+    "opt-in-native-initiative",
+    "authoritative-system-mcp-catalog",
+    "skip-synthetic-autopoke-feedback",
+    "per-client-autopoke-startup-policy",
+    "indefinite-transient-provider-retry",
+    "terminal-state-reconciliation"
+  ]
+}

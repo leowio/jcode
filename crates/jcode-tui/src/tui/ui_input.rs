@@ -545,7 +545,8 @@ fn connection_phase_label(phase: &ConnectionPhase) -> String {
         ConnectionPhase::SendingRequest => "sending context".to_string(),
         ConnectionPhase::WaitingForResponse => "waiting for response".to_string(),
         ConnectionPhase::Streaming => "streaming".to_string(),
-        ConnectionPhase::Retrying { attempt, max } => format!("retrying {}/{}", attempt, max),
+        ConnectionPhase::Retrying { attempt, max: 0 } => format!("retrying {attempt}"),
+        ConnectionPhase::Retrying { attempt, max } => format!("retrying {attempt}/{max}"),
     }
 }
 

@@ -14,7 +14,7 @@ pub(in crate::tui::app) async fn begin_remote_send(
     is_system: bool,
     system_reminder: Option<String>,
     auto_retry: bool,
-    retry_attempts: u8,
+    retry_attempts: u32,
 ) -> Result<u64> {
     app.prepare_cloud_environment(remote).await?;
     let recovery = app.cloud_recovery_reminder();
@@ -41,6 +41,7 @@ pub(in crate::tui::app) async fn begin_remote_send(
     app.current_message_id = Some(msg_id);
     app.deferred_stream_done_id = None;
     app.is_processing = true;
+    app.note_turn_started();
     app.status = ProcessingStatus::Sending;
     app.status_detail = None;
     app.processing_started = Some(Instant::now());

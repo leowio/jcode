@@ -26,7 +26,7 @@ mod feedback;
 mod file_diff;
 pub(crate) mod file_lock;
 mod gmail;
-// The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
+// Native initiatives are opt-in for managed system runtimes; default remains off.
 pub mod applet;
 #[allow(dead_code)]
 mod goal;
@@ -549,8 +549,6 @@ impl Registry {
                 session_search::SessionSearchTool::new,
             );
             Self::insert_tool_timed(&mut m, &mut timings, "memory", memory::MemoryTool::new);
-            // Initiative is temporarily unavailable. Keep its implementation and
-            // saved data intact so it can be restored without a migration.
             Self::insert_tool_timed(&mut m, &mut timings, "gmail", gmail::GmailTool::new);
             Self::insert_tool_timed(
                 &mut m,
@@ -614,6 +612,11 @@ impl Registry {
 
         let base_start = std::time::Instant::now();
         let mut tools_map = Self::base_tools(&skills);
+        // Apply per construction, outside the process-wide base-tool cache.
+        // Managed controllers explicitly opt in; ordinary Jcode is unchanged.
+        if std::env::var("JCODE_ENABLE_INITIATIVE").as_deref() == Ok("1") {
+            Self::insert_tool(&mut tools_map, "initiative", goal::InitiativeTool::new());
+        }
         let base_ms = base_start.elapsed().as_millis();
 
         // Per-session tools that need provider/registry references

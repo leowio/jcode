@@ -714,11 +714,17 @@ impl McpConfig {
         reason = "Import logic keeps source-specific MCP config merge order explicit"
     )]
     pub fn load_for_dir(project_dir: Option<&std::path::Path>) -> Self {
-        // Codex CLI is a one-time migration. Claude Code remains a live source.
-        Self::import_from_codex_once();
+        // Managed system catalogs are authoritative. In particular, a router
+        // rooted at HOME must not treat HOME/.jcode as project-local config.
+        let system_only = std::env::var("JCODE_SYSTEM_MCP_ONLY").as_deref() == Ok("1");
+        // Ordinary runtimes retain one-time Codex migration and live Claude sources.
+        if !system_only {
+            Self::import_from_codex_once();
+        }
 
         let mut merged = Self::default();
-        let claude_mcp_enabled = std::env::var_os("JCODE_DISABLE_CLAUDE_MCP").is_none();
+        let claude_mcp_enabled = !system_only
+            && std::env::var_os("JCODE_DISABLE_CLAUDE_MCP").is_none();
 
         // Load jcode's own global config (~/.jcode/mcp.json)
         if let Ok(jcode_dir) = crate::storage::jcode_dir() {
@@ -768,7 +774,7 @@ impl McpConfig {
         }
 
         // Project-local config files, resolved against the project directory.
-        if let Some(project_root) = project_dir {
+        if !system_only && let Some(project_root) = project_dir {
             Self::merge_servers_preferring_runnable(
                 &mut merged.servers,
                 Self::load_project_locals(project_root).servers,

@@ -441,21 +441,6 @@ impl App {
         };
 
         let config = crate::config::Config::load().provider;
-        if remote_resend
-            .as_ref()
-            .is_some_and(|payload| payload.retry_attempts >= Self::AUTO_RETRY_MAX_ATTEMPTS)
-            && config.cross_provider_failover == crate::config::CrossProviderFailoverMode::Countdown
-        {
-            if let Some(payload) = remote_resend {
-                self.restore_failover_payload(payload);
-            }
-            self.push_display_message(DisplayMessage::system(format!(
-                "Stopped automatic failover after {} retries. Use /model to choose a working account and resend manually.",
-                Self::AUTO_RETRY_MAX_ATTEMPTS
-            )));
-            self.set_status_notice("Paused: automatic failover retry limit reached");
-            return;
-        }
         match config.cross_provider_failover {
             crate::config::CrossProviderFailoverMode::Manual => {
                 if let Some(payload) = remote_resend {
@@ -1361,6 +1346,7 @@ impl App {
         let error = error.into();
         self.refresh_openai_usage_after_quota_error(&error);
         self.last_stream_error = Some(error.clone());
+        self.note_turn_failed(Self::compact_provider_failure(&error));
 
         if let Some(prompt) = crate::provider::parse_failover_prompt_message(&error) {
             self.handle_provider_failover_prompt(prompt);
