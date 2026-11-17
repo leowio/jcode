@@ -246,7 +246,7 @@ async fn retry_policy_opaque_https_transient_failure_returns_to_retry_owner() {
     let error = super::openai_stream_runtime::recover_opaque_ws_rejection(
         Arc::new(RwLock::new(prewarm_test_credentials())),
         None,
-        serde_json::json!({"model":"gpt-5.6-sol","input":[],"stream":true}),
+        &serde_json::json!({"model":"gpt-5.6-sol","input":[],"stream":true}),
         &tx,
     )
     .await

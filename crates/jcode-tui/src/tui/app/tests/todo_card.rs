@@ -75,108 +75,6 @@ fn ssh_pinned_todos_arrive_before_history_and_survive_it() {
 }
 
 #[test]
-fn resumed_local_snapshot_keeps_polling_so_card_does_not_go_stale() {
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.remote_session_id = Some("resumed-local-snapshot".into());
-    let payload = |status: &str| {
-        serde_json::json!({
-            "todos": [{"id":"lane", "content":"Integrate lane", "priority":"high", "status":status}],
-            "plan": {}, "goals": []
-        })
-        .to_string()
-    };
-    // Resume seeds an authoritative snapshot, after which disk is ignored.
-    assert!(app.receive_remote_todos("resumed-local-snapshot".into(), payload("in_progress")));
-    assert!(
-        !app.receive_remote_todos("resumed-local-snapshot".into(), payload("in_progress")),
-        "an identical poll answer must not ask for a repaint"
-    );
-    app.toggle_todo_card();
-    assert!(
-        app.remote_todos_refresh_due(),
-        "a snapshot-backed card must request fresh todos, not freeze"
-    );
-    app.receive_remote_todos("resumed-local-snapshot".into(), payload("completed"));
-    let card = app
-        .display_messages
-        .iter()
-        .find(|m| m.role == "todos")
-        .unwrap();
-    assert!(card.content.contains("completed"), "{}", card.content);
-}
-
-#[test]
-fn background_turn_polls_todos_slowly_and_catches_up_on_focus() {
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.remote_session_id = Some("background-turn".into());
-    let payload = serde_json::json!({
-        "todos": [{"id":"lane", "content":"Lane", "priority":"high", "status":"pending"}],
-        "plan": {}, "goals": []
-    })
-    .to_string();
-    app.receive_remote_todos("background-turn".into(), payload);
-    app.toggle_todo_card();
-    app.is_processing = true;
-    let five_seconds_ago = std::time::Instant::now() - std::time::Duration::from_secs(5);
-
-    app.remote_todos_requested_at = Some(five_seconds_ago);
-    assert!(
-        app.remote_todos_refresh_due(),
-        "a focused turn keeps the 2s poll"
-    );
-
-    app.set_client_focused(false);
-    app.remote_todos_requested_at = Some(five_seconds_ago);
-    assert!(
-        !app.remote_todos_refresh_due(),
-        "an unfocused turn must not poll every 2s"
-    );
-
-    app.set_client_focused(true);
-    assert!(
-        app.remote_todos_refresh_due(),
-        "gaining focus refreshes at once"
-    );
-}
-
-#[test]
-fn a_pushing_server_ends_the_periodic_todo_poll() {
-    let mut app = create_test_app();
-    app.is_remote = true;
-    app.remote_session_id = Some("pushed-turn".into());
-    let payload = serde_json::json!({
-        "todos": [{"id":"lane", "content":"Lane", "priority":"high", "status":"pending"}],
-        "plan": {}, "goals": []
-    })
-    .to_string();
-    app.receive_remote_todos("pushed-turn".into(), payload);
-    app.toggle_todo_card();
-    app.is_processing = true;
-    let a_minute_ago = std::time::Instant::now() - std::time::Duration::from_secs(60);
-
-    app.remote_todos_requested_at = Some(a_minute_ago);
-    assert!(
-        app.remote_todos_refresh_due(),
-        "a server that does not push is still polled"
-    );
-
-    app.remote_todos_pushed = true;
-    app.remote_todos_requested_at = Some(a_minute_ago);
-    assert!(
-        !app.remote_todos_refresh_due(),
-        "a focused turn must not poll a server that pushes"
-    );
-
-    app.request_remote_todos_refresh_soon();
-    assert!(
-        app.remote_todos_refresh_due(),
-        "an explicit refresh still asks once"
-    );
-}
-
-#[test]
 fn ssh_todos_command_renders_remote_card() {
     if super::commands_dispatch::ssh_test_runs_in_child("ssh_todos_command_renders_remote_card") {
         return;
@@ -1007,9 +905,16 @@ fn clicking_pinned_flat_task_expands_details_without_a_summary_header() {
     app.push_display_message(DisplayMessage::assistant("conversation stays visible"));
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 35)).unwrap();
     let compact = render_and_snap(&app, &mut terminal);
-    let row = compact.lines().position(|line| line.contains("Current task")).unwrap() as u16;
+    let row = compact
+        .lines()
+        .position(|line| line.contains("Current task"))
+        .unwrap() as u16;
     let column = 8;
-    assert!(compact.lines().any(|line| line.contains("Current task") && line.contains("[validated]")));
+    assert!(
+        compact
+            .lines()
+            .any(|line| line.contains("Current task") && line.contains("[validated]"))
+    );
     assert!(!compact.contains("click to expand") && !compact.contains("Todos ·"));
     app.handle_mouse_event(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -1018,11 +923,24 @@ fn clicking_pinned_flat_task_expands_details_without_a_summary_header() {
         modifiers: KeyModifiers::NONE,
     });
     let expanded = render_and_snap(&app, &mut terminal);
-    assert!(expanded.contains("Only the selected task details"), "{expanded}");
-    assert!(expanded.lines().any(|line| line.contains("Current task") && line.contains("[validated]")));
-    let row = expanded.lines().position(|line| line.contains("Current task")).unwrap() as u16;
+    assert!(
+        expanded.contains("Only the selected task details"),
+        "{expanded}"
+    );
+    assert!(
+        expanded
+            .lines()
+            .any(|line| line.contains("Current task") && line.contains("[validated]"))
+    );
+    let row = expanded
+        .lines()
+        .position(|line| line.contains("Current task"))
+        .unwrap() as u16;
     app.handle_mouse_event(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left), column, row, modifiers: KeyModifiers::NONE,
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
     });
     assert!(!render_and_snap(&app, &mut terminal).contains("Only the selected task details"));
 }
@@ -1051,9 +969,7 @@ fn pinned_todo_card_shows_tasks_without_expanding() {
         assert!(!rendered.contains("▸ todo"), "{rendered}");
         assert!(!rendered.contains("▾ todo"), "{rendered}");
         assert!(!rendered.contains("Todos ·") && !rendered.contains("click to expand"));
-        println!(
-            "{width}x40: all 3 todo states visible without a redundant header"
-        );
+        println!("{width}x40: all 3 todo states visible without a redundant header");
     }
 }
 
@@ -1239,13 +1155,24 @@ fn expanded_pinned_todo_band_scrolls_when_taller_than_budget() {
     crate::tui::ui::viewport::reset_pinned_todo_scroll();
 
     let (lines, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
-    assert!(lines.len() <= 21, "expanded band is bounded: {}", lines.len());
+    assert!(
+        lines.len() <= 21,
+        "expanded band is bounded: {}",
+        lines.len()
+    );
     let control = control.unwrap();
-    assert!(!lines.iter().any(|line| line.to_string().contains("click to expand")));
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.to_string().contains("click to expand"))
+    );
     crate::tui::ui::viewport::publish_pinned_todo_scroll_for_test();
     assert!(crate::tui::ui::viewport::scroll_pinned_todos(3));
     let (scrolled, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
-    assert_ne!(lines[control + 1].to_string(), scrolled[control + 1].to_string());
+    assert_ne!(
+        lines[control + 1].to_string(),
+        scrolled[control + 1].to_string()
+    );
     crate::tui::ui::viewport::reset_pinned_todo_scroll();
 }
 
@@ -1261,44 +1188,85 @@ fn pinned_todo_panel_has_padding_and_clickable_fold_at_rendered_coordinates() {
     let mut active = pinned_band_todo("active", "Current task", "in_progress");
     active.details = Some("Expanded current task description".into());
     active.confidence = Some(crate::todo::ConfidenceState::Validated);
-    app.pinned_todos_payload = Some(serde_json::json!({
-        "todos": [
-            pinned_band_todo("done", "Finished task", "completed"),
-            active,
-            pinned_band_todo("next", "Queued task", "pending"),
-        ],
-        "plan": {"user_intention": "Keep the plan distinct", "understands_user_intent": "clear"}
-    }).to_string());
+    app.pinned_todos_payload = Some(
+        serde_json::json!({
+            "todos": [
+                pinned_band_todo("done", "Finished task", "completed"),
+                active,
+                pinned_band_todo("next", "Queued task", "pending"),
+            ],
+            "plan": {"user_intention": "Keep the plan distinct", "understands_user_intent": "clear"}
+        })
+        .to_string(),
+    );
     app.push_display_message(DisplayMessage::assistant("ordinary transcript content"));
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 40)).unwrap();
     let rendered = render_and_snap(&app, &mut terminal);
     let control = crate::tui::ui::viewport::pinned_todo_lane_area_for_test("active").unwrap();
     let rows: Vec<_> = rendered.lines().collect();
-    let intent_row = rows.iter().position(|row| row.contains("Keep the plan distinct")).unwrap();
-    assert!(rows[intent_row + 1].trim().is_empty(), "intent and todos have a blank row between them");
+    let intent_row = rows
+        .iter()
+        .position(|row| row.contains("Keep the plan distinct"))
+        .unwrap();
+    assert!(
+        rows[intent_row + 1].trim().is_empty(),
+        "intent and todos have a blank row between them"
+    );
     assert!(rows[intent_row - 1].trim().is_empty(), "top padding");
     assert!(rows[control.y as usize].contains("Current task [validated]"));
     assert!(!rendered.contains("Todos ·") && !rendered.contains("click to expand"));
-    let last_task = rows.iter().position(|row| row.contains("Queued task")).unwrap();
+    let last_task = rows
+        .iter()
+        .position(|row| row.contains("Queued task"))
+        .unwrap();
     assert!(rows[last_task + 1].trim().is_empty(), "bottom padding");
     let background = terminal.backend().buffer()[(control.x, control.y)].bg;
     assert_ne!(background, ratatui::style::Color::Reset);
     for y in intent_row as u16 - 1..=last_task as u16 + 1 {
         for x in control.x..control.right() {
-            assert_eq!(terminal.backend().buffer()[(x, y)].bg, background, "full-width tint at ({x},{y})");
+            assert_eq!(
+                terminal.backend().buffer()[(x, y)].bg,
+                background,
+                "full-width tint at ({x},{y})"
+            );
         }
     }
-    let prose_row = rows.iter().position(|row| row.contains("ordinary transcript content")).unwrap();
-    assert_ne!(terminal.backend().buffer()[(control.x, prose_row as u16)].bg, background);
+    let prose_row = rows
+        .iter()
+        .position(|row| row.contains("ordinary transcript content"))
+        .unwrap();
+    assert_ne!(
+        terminal.backend().buffer()[(control.x, prose_row as u16)].bg,
+        background
+    );
 
     for (kind, column, row) in [
-        (MouseEventKind::Down(MouseButton::Right), control.x, control.y),
-        (MouseEventKind::Down(MouseButton::Left), control.right(), control.y),
-        (MouseEventKind::Down(MouseButton::Left), control.x, intent_row as u16 + 1),
+        (
+            MouseEventKind::Down(MouseButton::Right),
+            control.x,
+            control.y,
+        ),
+        (
+            MouseEventKind::Down(MouseButton::Left),
+            control.right(),
+            control.y,
+        ),
+        (
+            MouseEventKind::Down(MouseButton::Left),
+            control.x,
+            intent_row as u16 + 1,
+        ),
     ] {
-        app.handle_mouse_event(MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE });
-        assert!(app.pinned_todo_expanded_lanes.is_empty(), "only a left click on the task expands details");
+        app.handle_mouse_event(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(
+            app.pinned_todo_expanded_lanes.is_empty(),
+            "only a left click on the task expands details"
+        );
     }
     let click = |area: ratatui::layout::Rect| MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
@@ -1309,7 +1277,10 @@ fn pinned_todo_panel_has_padding_and_clickable_fold_at_rendered_coordinates() {
     app.handle_mouse_event(click(control));
     assert_eq!(app.pinned_todo_expanded_lanes, ["active"]);
     let folded = render_and_snap(&app, &mut terminal);
-    assert!(folded.contains("Keep the plan distinct"), "intent remains visible");
+    assert!(
+        folded.contains("Keep the plan distinct"),
+        "intent remains visible"
+    );
     assert!(folded.contains("Expanded current task description"));
     assert!(folded.contains("Current task"));
     let control = crate::tui::ui::viewport::pinned_todo_lane_area_for_test("active").unwrap();
@@ -1319,7 +1290,10 @@ fn pinned_todo_panel_has_padding_and_clickable_fold_at_rendered_coordinates() {
 
     app.pinned_todos_payload = None;
     render_and_snap(&app, &mut terminal);
-    assert!(crate::tui::ui::viewport::pinned_todo_lane_area_for_test("active").is_none(), "no stale click target after clearing todos");
+    assert!(
+        crate::tui::ui::viewport::pinned_todo_lane_area_for_test("active").is_none(),
+        "no stale click target after clearing todos"
+    );
 }
 
 #[test]
@@ -1331,18 +1305,28 @@ fn pinned_todo_panel_fits_small_terminals_and_keeps_intent_when_scrolling() {
     let todos: Vec<_> = (0..40)
         .map(|i| pinned_band_todo(&format!("t{i}"), &format!("界面 task {i}"), "pending"))
         .collect();
-    app.pinned_todos_payload = Some(serde_json::json!({
-        "todos": todos,
-        "plan": {"user_intention": "Keep intent visible", "understands_user_intent": "clear"}
-    }).to_string());
+    app.pinned_todos_payload = Some(
+        serde_json::json!({
+            "todos": todos,
+            "plan": {"user_intention": "Keep intent visible", "understands_user_intent": "clear"}
+        })
+        .to_string(),
+    );
     for expanded in [false, true] {
         app.pinned_todos_expanded = expanded;
         for width in [0, 15, 16, 24, 40, 80, 200] {
             for height in 0..45 {
-                let (lines, control) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, width, height);
-                assert!(lines.iter().all(|line| line.width() <= width as usize), "width {width}, height {height}");
+                let (lines, control) =
+                    crate::tui::ui::viewport::pinned_todo_band_lines(&app, width, height);
+                assert!(
+                    lines.iter().all(|line| line.width() <= width as usize),
+                    "width {width}, height {height}"
+                );
                 if width >= 16 && height >= 3 {
-                    assert!(lines.len() < height as usize, "panel leaves transcript space at {width}x{height}");
+                    assert!(
+                        lines.len() < height as usize,
+                        "panel leaves transcript space at {width}x{height}"
+                    );
                     assert!(control.is_some_and(|row| row < lines.len()));
                 } else {
                     assert!(lines.is_empty());
@@ -1357,25 +1341,38 @@ fn pinned_todo_panel_fits_small_terminals_and_keeps_intent_when_scrolling() {
     assert!(crate::tui::ui::viewport::scroll_pinned_todos(3));
     let (after, _) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, 80, 30);
     let control = control.unwrap();
-    assert_eq!(before[..control], after[..control], "intent and padding stay fixed");
-    assert_ne!(before[control + 1], after[control + 1], "task window scrolls");
+    assert_eq!(
+        before[..control],
+        after[..control],
+        "intent and padding stay fixed"
+    );
+    assert_ne!(
+        before[control + 1],
+        after[control + 1],
+        "task window scrolls"
+    );
     // Use explicit theme modes without changing process-global theme settings.
     // Padding and trailing spaces must remain a panel on both dark and light terminals.
-    for mode in [jcode_tui_style::ThemeMode::Dark, jcode_tui_style::ThemeMode::Light] {
+    for mode in [
+        jcode_tui_style::ThemeMode::Dark,
+        jcode_tui_style::ThemeMode::Light,
+    ] {
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 32)).unwrap();
         let mut painted = None;
-        terminal.draw(|frame| {
-            let area = ratatui::layout::Rect::new(0, 0, 80, before.len() as u16);
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(before.clone()).style(
-                    ratatui::style::Style::default().bg(jcode_tui_style::theme::user_bg()),
-                ),
-                area,
-            );
-            jcode_tui_style::theme_mode::adapt_buffer(frame.buffer_mut(), mode);
-            painted = Some(frame.buffer_mut().clone());
-        }).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = ratatui::layout::Rect::new(0, 0, 80, before.len() as u16);
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(before.clone()).style(
+                        ratatui::style::Style::default().bg(jcode_tui_style::theme::user_bg()),
+                    ),
+                    area,
+                );
+                jcode_tui_style::theme_mode::adapt_buffer(frame.buffer_mut(), mode);
+                painted = Some(frame.buffer_mut().clone());
+            })
+            .unwrap();
         // TestBackend omits continuation cells after wide CJK glyphs when it
         // applies the terminal diff. Inspect the fully painted frame instead.
         let buffer = painted.unwrap();
@@ -1383,12 +1380,26 @@ fn pinned_todo_panel_fits_small_terminals_and_keeps_intent_when_scrolling() {
         assert_ne!(background, ratatui::style::Color::Reset);
         for y in 0..before.len() as u16 {
             for x in 0..80 {
-                assert_eq!(buffer[(x, y)].bg, background, "{mode:?} surface at ({x},{y})");
+                assert_eq!(
+                    buffer[(x, y)].bg,
+                    background,
+                    "{mode:?} surface at ({x},{y})"
+                );
             }
         }
-        assert_eq!(buffer[(0, before.len() as u16)].bg, ratatui::style::Color::Reset);
+        assert_eq!(
+            buffer[(0, before.len() as u16)].bg,
+            ratatui::style::Color::Reset
+        );
     }
-    println!("expanded panel:\n{}", before.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n"));
+    println!(
+        "expanded panel:\n{}",
+        before
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
     crate::tui::ui::viewport::reset_pinned_todo_scroll();
 }
 
@@ -1400,7 +1411,11 @@ fn pinned_todo_lane_click_expands_details_without_hiding_other_lanes() {
     let _pin = PinTodosEnvGuard::enable();
     let mut app = create_test_app();
     app.session.short_name = Some("test".into());
-    let mut read = pinned_band_todo("read", "Read skill and inspect permissions for the selected project until the full title is visible", "completed");
+    let mut read = pinned_band_todo(
+        "read",
+        "Read skill and inspect permissions for the selected project until the full title is visible",
+        "completed",
+    );
     read.stage = Some(1);
     read.group = Some("access-setup".into());
     read.details = Some("Detailed permission scope and acceptance evidence".into());
@@ -1413,29 +1428,68 @@ fn pinned_todo_lane_click_expands_details_without_hiding_other_lanes() {
     let mut verify = pinned_band_todo("verify", "Other lane remains visible", "pending");
     verify.stage = Some(1);
     verify.group = Some("validation".into());
-    app.pinned_todos_payload = Some(serde_json::json!({"todos":[read, update, verify]}).to_string());
+    app.pinned_todos_payload =
+        Some(serde_json::json!({"todos":[read, update, verify]}).to_string());
     app.push_display_message(DisplayMessage::assistant("conversation stays visible"));
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 45)).unwrap();
     let compact = render_and_snap(&app, &mut terminal);
     assert!(!compact.contains("Detailed permission scope"));
-    let row = compact.lines().position(|row| row.contains("access-setup")).unwrap() as u16;
+    let row = compact
+        .lines()
+        .position(|row| row.contains("access-setup"))
+        .unwrap() as u16;
     let header = crate::tui::ui::viewport::pinned_todo_lane_area_for_test("read").unwrap();
     let click = |row| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left), column: header.x + 4, row,
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: header.x + 4,
+        row,
         modifiers: KeyModifiers::NONE,
     };
     app.handle_mouse_event(click(row));
     let expanded = render_and_snap(&app, &mut terminal);
-    assert!(expanded.contains("Detailed permission scope and acceptance evidence"), "{expanded}");
-    assert!(expanded.lines().any(|line| line.contains("Read skill") && line.contains("[verified]")), "{expanded}");
-    assert!(expanded.lines().any(|line| line.contains("Update scoped IAM credentials") && line.contains("[plausible]")), "{expanded}");
-    assert!(!expanded.contains("Completion confidence:") && !expanded.contains("Agent confidence:"));
-    assert!(!expanded.contains("[speculative]"), "finished tasks use completion confidence");
-    let expanded_words = expanded.replace("[verified]", "").replace("[plausible]", "").split_whitespace().collect::<Vec<_>>().join(" ");
-    assert!(expanded_words.contains("full title is visible"), "long task titles unwrap into detail rows: {expanded}");
-    assert!(expanded.contains("validation"), "other lanes must not disappear");
+    assert!(
+        expanded.contains("Detailed permission scope and acceptance evidence"),
+        "{expanded}"
+    );
+    assert!(
+        expanded
+            .lines()
+            .any(|line| line.contains("Read skill") && line.contains("[verified]")),
+        "{expanded}"
+    );
+    assert!(
+        expanded
+            .lines()
+            .any(|line| line.contains("Update scoped IAM credentials")
+                && line.contains("[plausible]")),
+        "{expanded}"
+    );
+    assert!(
+        !expanded.contains("Completion confidence:") && !expanded.contains("Agent confidence:")
+    );
+    assert!(
+        !expanded.contains("[speculative]"),
+        "finished tasks use completion confidence"
+    );
+    let expanded_words = expanded
+        .replace("[verified]", "")
+        .replace("[plausible]", "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        expanded_words.contains("full title is visible"),
+        "long task titles unwrap into detail rows: {expanded}"
+    );
+    assert!(
+        expanded.contains("validation"),
+        "other lanes must not disappear"
+    );
     assert!(expanded.contains("conversation stays visible"));
-    let row = expanded.lines().position(|row| row.contains("access-setup")).unwrap() as u16;
+    let row = expanded
+        .lines()
+        .position(|row| row.contains("access-setup"))
+        .unwrap() as u16;
     app.handle_mouse_event(click(row));
     let compact = render_and_snap(&app, &mut terminal);
     assert!(!compact.contains("Detailed permission scope"));
@@ -1452,26 +1506,40 @@ fn pinned_intent_click_unwraps_and_folds_independently_of_todo_details() {
     let mut app = create_test_app();
     app.session.short_name = Some("test".into());
     let intent = "Keep the intent visible and clickable so the user can read all of the long explanation without hiding the compact task overview. Verify the complete sentence reaches INTENT_END.";
-    app.pinned_todos_payload = Some(serde_json::json!({
-        "todos":[pinned_band_todo("task", "Task stays visible", "pending")],
-        "plan":{"user_intention":intent, "understands_user_intent":"clear"}
-    }).to_string());
+    app.pinned_todos_payload = Some(
+        serde_json::json!({
+            "todos":[pinned_band_todo("task", "Task stays visible", "pending")],
+            "plan":{"user_intention":intent, "understands_user_intent":"clear"}
+        })
+        .to_string(),
+    );
     app.push_display_message(DisplayMessage::assistant("normal conversation"));
     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(65, 40)).unwrap();
     let compact = render_and_snap(&app, &mut terminal);
     assert!(!compact.contains("INTENT_END"));
-    let intent_row = compact.lines().position(|row| row.contains("Intent clear")).unwrap_or_else(|| panic!("intent missing: {compact}")) as u16;
+    let intent_row = compact
+        .lines()
+        .position(|row| row.contains("Intent clear"))
+        .unwrap_or_else(|| panic!("intent missing: {compact}")) as u16;
     let area = crate::tui::ui::viewport::pinned_todo_lane_area_for_test("task").unwrap();
     let click = |row| MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left), column: area.x + 6, row,
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 6,
+        row,
         modifiers: KeyModifiers::NONE,
     };
     app.handle_mouse_event(click(intent_row));
     let full = render_and_snap(&app, &mut terminal);
     assert!(full.contains("INTENT_END"), "{full}");
     assert!(full.contains("Task stays visible"));
-    assert!(!app.pinned_todos_expanded, "intent unwrap is independent of task detail mode");
-    let intent_row = full.lines().position(|row| row.contains("Intent clear")).unwrap() as u16;
+    assert!(
+        !app.pinned_todos_expanded,
+        "intent unwrap is independent of task detail mode"
+    );
+    let intent_row = full
+        .lines()
+        .position(|row| row.contains("Intent clear"))
+        .unwrap() as u16;
     app.handle_mouse_event(click(intent_row));
     let folded = render_and_snap(&app, &mut terminal);
     assert!(!folded.contains("INTENT_END"));
@@ -1493,15 +1561,26 @@ fn pinned_expanded_intent_keeps_tasks_visible_and_does_not_clip_words() {
         }).to_string());
         for width in [24, 40, 65, 100] {
             for height in [9, 12, 20, 200] {
-                let (lines, start) = crate::tui::ui::viewport::pinned_todo_band_lines(&app, width, height);
+                let (lines, start) =
+                    crate::tui::ui::viewport::pinned_todo_band_lines(&app, width, height);
                 assert!(lines.len() < height as usize);
                 assert!(lines.iter().all(|line| line.width() <= width as usize));
-                let text = lines.iter().map(ToString::to_string).collect::<Vec<_>>().join("\n");
-                assert!(text.contains("TASK"), "task window at {width}x{height}: {text}");
+                let text = lines
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    text.contains("TASK"),
+                    "task window at {width}x{height}: {text}"
+                );
                 assert!(start.is_some_and(|row| row < lines.len()));
                 if repetitions == 1 && height == 200 {
                     for word in &words {
-                        assert!(text.contains(word), "missing {word} at width {width}: {text}");
+                        assert!(
+                            text.contains(word),
+                            "missing {word} at width {width}: {text}"
+                        );
                     }
                 }
                 assert!(!text.contains("Todos ·") && !text.contains("click to expand"));
@@ -1521,7 +1600,9 @@ fn pinned_waiting_lane_can_expand_with_inline_confidence() {
     let mut task = pinned_band_todo("login", "Authenticate account", "pending");
     task.stage = Some(1);
     task.group = Some("access".into());
-    task.requires_user_auth = Some(crate::todo::TodoUserAuth { reason: "Owner authentication needed".into() });
+    task.requires_user_auth = Some(crate::todo::TodoUserAuth {
+        reason: "Owner authentication needed".into(),
+    });
     task.details = Some("Scoped credential details".into());
     task.confidence = Some(crate::todo::ConfidenceState::Plausible);
     app.pinned_todos_payload = Some(serde_json::json!({"todos": [task]}).to_string());
@@ -1530,11 +1611,20 @@ fn pinned_waiting_lane_can_expand_with_inline_confidence() {
     render_and_snap(&app, &mut terminal);
     let area = crate::tui::ui::viewport::pinned_todo_lane_area_for_test("login").unwrap();
     app.handle_mouse_event(MouseEvent {
-        kind: MouseEventKind::Down(MouseButton::Left), column: area.x + 4, row: area.y,
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: area.x + 4,
+        row: area.y,
         modifiers: KeyModifiers::NONE,
     });
     let expanded = render_and_snap(&app, &mut terminal);
     assert!(expanded.contains("Scoped credential details"), "{expanded}");
     assert!(expanded.contains("Needs your login: Owner authentication needed"));
-    assert!(expanded.lines().any(|line| line.contains("Authenticate account") && line.contains("[plausible]")), "{expanded}");
+    assert!(
+        expanded
+            .lines()
+            .any(|line| line.contains("Authenticate account") && line.contains("[plausible]")),
+        "{expanded}"
+    );
 }
+#[path = "todo_card_additional_tests.rs"]
+mod additional_resumed_local_snapshot_keeps_polling_so_card_does_not_go_stale;

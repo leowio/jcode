@@ -186,7 +186,7 @@ async fn opaque_recovery_case(
         encrypted_content.truncate(compaction_chars);
         vec![ChatMessage {
             role: Role::User,
-            content: vec![ContentBlock::OpenAICompaction { encrypted_content }],
+            content: vec![ContentBlock::OpenAICompaction { encrypted_content }].into(),
             timestamp: None,
             tool_duration_ms: None,
         }]
@@ -200,7 +200,8 @@ async fn opaque_recovery_case(
                     summary: vec!["prior thought".into()],
                     encrypted_content: Some("encrypted-history".into()),
                     status: Some("completed".into()),
-                }],
+                }]
+                .into(),
                 timestamp: None,
                 tool_duration_ms: None,
             },
