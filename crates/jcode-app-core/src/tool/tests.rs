@@ -1678,8 +1678,32 @@ async fn test_single_output_ceiling_is_absolute_not_only_proportional() {
     }
 }
 
+struct InitiativeEnvGuard(Option<OsString>);
+impl InitiativeEnvGuard {
+    fn set(value: Option<&str>) -> Self {
+        let previous = std::env::var_os("JCODE_ENABLE_INITIATIVE");
+        if let Some(value) = value {
+            crate::env::set_var("JCODE_ENABLE_INITIATIVE", value);
+        } else {
+            crate::env::remove_var("JCODE_ENABLE_INITIATIVE");
+        }
+        Self(previous)
+    }
+}
+impl Drop for InitiativeEnvGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = &self.0 {
+            crate::env::set_var("JCODE_ENABLE_INITIATIVE", previous);
+        } else {
+            crate::env::remove_var("JCODE_ENABLE_INITIATIVE");
+        }
+    }
+}
+
 #[tokio::test]
 async fn initiative_is_not_registered_or_advertised() {
+    let _env_lock = crate::storage::lock_test_env();
+    let _flag = InitiativeEnvGuard::set(None);
     let registry = Registry::new(Arc::new(MockProvider)).await;
     let names = registry.tool_names().await;
     assert!(names.iter().any(|name| name == "todo"));
@@ -1934,3 +1958,84 @@ async fn dump_tool_definitions() {
 
 #[path = "tests_additional_tests.rs"]
 mod additional_base_tools_do_not_expose_invalid_reporting_tool;
+
+#[tokio::test]
+async fn managed_initiative_registration_lifecycle_and_provider_schemas() {
+    let _env_lock = crate::storage::lock_test_env();
+    let private = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let _home = TestHomeGuard::new(private.path());
+    let _flag = InitiativeEnvGuard::set(Some("1"));
+    let registry = Registry::new(Arc::new(MockProvider)).await;
+    assert!(
+        registry
+            .tool_names()
+            .await
+            .iter()
+            .any(|name| name == "initiative")
+    );
+    let definition = registry
+        .definitions(None)
+        .await
+        .into_iter()
+        .find(|definition| definition.name == "initiative")
+        .expect("advertised native initiative");
+    assert!(jcode_schema_dialect::untyped_properties(&definition.input_schema).is_empty());
+    for spec in jcode_schema_dialect::registry::ALL {
+        let normalized = jcode_schema_dialect::dialect::apply(&definition.input_schema, spec);
+        assert!(
+            jcode_schema_dialect::must_not_contain_unsupported_constructs(&normalized, spec)
+                .is_empty(),
+            "initiative schema rejected by {}",
+            spec.id
+        );
+        assert!(
+            jcode_schema_dialect::must_preserve_meaning(&definition.input_schema, &normalized)
+                .is_empty(),
+            "initiative schema lost meaning for {}",
+            spec.id
+        );
+    }
+    let mut context = mcp_test_context(project.path());
+    context.session_id = "managed-initiative-lifecycle".to_string();
+    let created = registry.execute("initiative", serde_json::json!({
+        "action":"create", "title":"Native managed migration", "scope":"project",
+        "success_criteria":["Persist shared knowledge"], "next_steps":["Verify native checkpoint"]
+    }), context.clone()).await.unwrap();
+    let id = created.metadata.as_ref().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let listed = registry
+        .execute(
+            "initiative",
+            serde_json::json!({"action":"list"}),
+            context.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(listed.output.contains("Native managed migration"));
+    registry.execute("initiative", serde_json::json!({
+        "action":"checkpoint", "id":id, "checkpoint_summary":"Native checkpoint verified", "progress_percent":75
+    }), context.clone()).await.unwrap();
+    let saved = crate::goal::load_goal(&id, None, Some(project.path()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.progress_percent, Some(75));
+    assert!(
+        serde_json::to_string(&saved)
+            .unwrap()
+            .contains("Native checkpoint verified")
+    );
+    // A flag change affects new registries even after base tools were cached.
+    drop(_flag);
+    let _disabled = InitiativeEnvGuard::set(Some("0"));
+    let ordinary = Registry::new(Arc::new(MockProvider)).await;
+    assert!(
+        !ordinary
+            .tool_names()
+            .await
+            .iter()
+            .any(|name| name == "initiative")
+    );
+}

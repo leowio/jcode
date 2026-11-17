@@ -26,7 +26,7 @@ mod feedback;
 mod file_diff;
 pub(crate) mod file_lock;
 mod gmail;
-// The initiative tool is intentionally unregistered (4928a1c92) but kept for re-enable.
+// Native initiatives are opt-in for managed runtimes.
 pub mod applet;
 #[allow(dead_code)]
 mod goal;
@@ -621,6 +621,11 @@ impl Registry {
 
         let base_start = std::time::Instant::now();
         let mut tools_map = Self::base_tools(&skills);
+        // Apply outside the shared base-tool cache so each registry observes
+        // its own opt-in, even after an ordinary registry warmed the cache.
+        if std::env::var("JCODE_ENABLE_INITIATIVE").as_deref() == Ok("1") {
+            Self::insert_tool(&mut tools_map, "initiative", goal::InitiativeTool::new());
+        }
         let base_ms = base_start.elapsed().as_millis();
 
         // Per-session tools that need provider/registry references
