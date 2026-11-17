@@ -37,7 +37,9 @@
 use base64::Engine as _;
 use jcode_message_types::{ContentBlock, Message};
 
-use crate::image_normalize::{normalize_image_bytes, sniff_provider_media_type};
+use crate::image_normalize::{
+    normalize_image_bytes, sniff_provider_media_type, validate_image_bytes,
+};
 
 /// Prefix of the label the agent emits after an image attached to a tool
 /// result (see `agent::tools`). Folded together with an omitted image.
@@ -218,7 +220,9 @@ fn format_needs_fix(media_type: &str, data_b64: &str) -> bool {
         return true;
     };
     match sniff_provider_media_type(&bytes) {
-        Some(actual) => !media_type.eq_ignore_ascii_case(actual),
+        Some(actual) => {
+            !media_type.eq_ignore_ascii_case(actual) || validate_image_bytes(&bytes).is_err()
+        }
         None => true,
     }
 }
@@ -230,10 +234,10 @@ fn ensure_provider_format(media_type: &mut String, data: &mut String) -> Result<
     let Some(bytes) = decode_b64(data) else {
         return Err("data is not valid base64, so it cannot be sent to the model".into());
     };
-    if sniff_provider_media_type(&bytes).is_some() {
+    let image = normalize_image_bytes(bytes)?;
+    if image.converted_from.is_none() {
         return Ok(false);
     }
-    let image = normalize_image_bytes(bytes)?;
     *media_type = image.media_type.to_string();
     *data = base64::engine::general_purpose::STANDARD.encode(&image.data);
     Ok(true)
@@ -828,5 +832,26 @@ mod tests {
             &out[0].content[0],
             ContentBlock::Text { text, .. } if text.starts_with("[Image omitted: image/png")
         ));
+    }
+
+    #[test]
+    fn truncated_png_is_quarantined_without_changing_valid_images_or_history() {
+        let good = encode_png(32, 32);
+        let raw = decode_b64(&good).unwrap();
+        let partial = base64::engine::general_purpose::STANDARD.encode(&raw[..raw.len() / 2]);
+        let messages = vec![image_message(partial.clone()), image_message(good.clone())];
+        let out = clamp_outbound_images(&messages).expect("partial PNG must be quarantined");
+        assert!(matches!(
+            &out[0].content[0],
+            ContentBlock::Text { text, .. } if text.contains("incomplete or corrupt")
+        ));
+        assert!(matches!(&out[1].content[0], ContentBlock::Image { data, .. } if data == &good));
+        assert!(
+            matches!(&messages[0].content[0], ContentBlock::Image { data, .. } if data == &partial)
+        );
+        assert!(
+            clamp_outbound_images(&out).is_none(),
+            "repair must be idempotent"
+        );
     }
 }

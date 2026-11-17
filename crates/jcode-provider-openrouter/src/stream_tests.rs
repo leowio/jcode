@@ -22,6 +22,23 @@ fn test_stream() -> OpenRouterStream {
 }
 
 #[test]
+fn gateway_sse_errors_preserve_classification_and_retry_delay() {
+    let mut stream = test_stream();
+    stream.buffer = "data: {\"error\":{\"type\":\"invalid_request_error\",\"code\":\"invalid_image\",\"message\":\"input_image image_url could not parse image: unexpected end of file\",\"retry_after\":3}}\n\n".into();
+    let Some(StreamEvent::Error {
+        message,
+        retry_after_secs,
+    }) = stream.parse_next_event()
+    else {
+        panic!("expected classified error");
+    };
+    assert!(message.contains("invalid_request_error"));
+    assert!(message.contains("invalid_image"));
+    assert!(message.contains("could not parse image"));
+    assert_eq!(retry_after_secs, Some(3));
+}
+
+#[test]
 fn resolved_model_reports_actual_alias_target_once_per_attempt() {
     for _attempt in 0..2 {
         let mut stream = test_stream();

@@ -384,7 +384,7 @@ fn handle_image_file(path: &Path, file_path: &str) -> Result<ToolOutput> {
                 .with_labeled_image(image.media_type, b64, file_path.to_string())
             }
             Err(reason) => ToolOutput::new(format!(
-                "Image: {} ({})\nDimensions: {}\nNot sent to the model: {}.",
+                "Image: {} ({})\nDimensions: {}\nNot sent to the model: {}. Wait for any producing or downloading task to finish, then read the file again.",
                 file_path, size_str, dim_str, reason
             )),
         }

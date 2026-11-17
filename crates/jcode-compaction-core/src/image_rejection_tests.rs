@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn codex_lb_truncated_input_image_triggers_recovery_with_or_without_envelope() {
+    let message = "input_image image_url could not parse image: unexpected end of file";
+    assert!(is_image_rejection_error(message));
+    assert!(is_image_rejection_error(&format!(
+        "HTTP 400 invalid_request_error: {message}"
+    )));
+    assert!(!is_image_rejection_error("unexpected end of file"));
+    assert!(!is_image_rejection_error(
+        "HTTP 400: invalid_request_error: missing model"
+    ));
+}
+
+#[test]
 fn openai_invalid_image_data_triggers_recovery() {
     assert!(is_image_rejection_error(
         "invalid_request_error (invalid_value): The image data you provided does not represent a valid image. Please check your input and try again."

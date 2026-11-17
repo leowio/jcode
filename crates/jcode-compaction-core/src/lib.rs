@@ -690,6 +690,11 @@ pub fn is_image_rejection_error(error: &str) -> bool {
     if is_request_payload_too_large_error(&lower) {
         return false;
     }
+    // Chat-completions gateways can deliver this precise input-validation
+    // error in an HTTP-200 SSE frame without retaining the 400/type envelope.
+    let malformed_input_image = lower.contains("input_image")
+        && lower.contains("image_url")
+        && lower.contains("could not parse image");
     let names_image_block = lower.contains(".image.source")
         || lower.contains(".image.")
         || lower.contains("image.source")
@@ -698,11 +703,13 @@ pub fn is_image_rejection_error(error: &str) -> bool {
         || lower.contains("does not represent a valid image")
         || lower.contains("unsupported image")
         || lower.contains("image_parse_error")
-        || lower.contains("invalid_image");
+        || lower.contains("invalid_image")
+        || malformed_input_image;
     let is_client_rejection = lower.contains("invalid_request_error")
         || lower.contains("invalid_image")
         || lower.contains("image_parse_error")
-        || contains_independent_status_code(&lower, "400");
+        || contains_independent_status_code(&lower, "400")
+        || malformed_input_image;
     names_image_block && is_client_rejection
 }
 

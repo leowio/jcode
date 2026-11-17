@@ -95,6 +95,7 @@ pub struct ProviderImage {
 ///   explanation suitable for showing to the model or the user.
 pub fn normalize_image_bytes(data: Vec<u8>) -> Result<ProviderImage, String> {
     if let Some(media_type) = sniff_provider_media_type(&data) {
+        validate_image_bytes(&data)?;
         return Ok(ProviderImage {
             media_type,
             data,
@@ -117,6 +118,63 @@ pub fn normalize_image_bytes(data: Vec<u8>) -> Result<ProviderImage, String> {
         )),
         None => Err("unrecognised or corrupt image data, so it cannot be sent to the model".into()),
     }
+}
+
+/// Decode the pixels, rather than trusting an image's header. A screenshot may
+/// have valid dimensions while its transfer is still writing the IDAT data.
+/// Cache successes by content (not path), so growing/replaced files are checked
+/// again without decoding every historical screenshot on every model call.
+pub fn validate_image_bytes(data: &[u8]) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static VALID: OnceLock<Mutex<HashSet<[u8; 32]>>> = OnceLock::new();
+    let cache = VALID.get_or_init(|| Mutex::new(HashSet::new()));
+    let digest: [u8; 32] = Sha256::digest(data).into();
+    if cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&digest)
+    {
+        return Ok(());
+    }
+    // PNG decoders may finish after the last scanline without reading IEND.
+    // Require complete chunks as well, including the terminal chunk.
+    if sniff_provider_media_type(data) == Some("image/png") {
+        let mut offset = 8;
+        loop {
+            let chunk = data
+                .get(offset..)
+                .filter(|chunk| chunk.len() >= 12)
+                .ok_or("image is incomplete or corrupt: PNG is missing its terminal chunk")?;
+            let len = u32::from_be_bytes(chunk[..4].try_into().unwrap()) as usize;
+            let chunk_len = len
+                .checked_add(12)
+                .filter(|len| *len <= chunk.len())
+                .ok_or("image is incomplete or corrupt: PNG chunk was truncated")?;
+            if &chunk[4..8] == b"IEND" {
+                if len != 0 {
+                    return Err("image is incomplete or corrupt: invalid PNG terminal chunk".into());
+                }
+                break;
+            }
+            offset += chunk_len;
+        }
+    }
+    image::ImageReader::new(std::io::Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|e| format!("image format could not be read: {e}"))?
+        .decode()
+        .map_err(|e| {
+            format!("image is incomplete or corrupt and cannot be sent to the model: {e}")
+        })?;
+    let mut valid = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if valid.len() >= 128 {
+        valid.clear();
+    }
+    valid.insert(digest);
+    Ok(())
 }
 
 fn reencode_png(data: &[u8]) -> Option<Vec<u8>> {
@@ -179,6 +237,30 @@ mod tests {
         assert_eq!(out.media_type, "image/png");
         assert_eq!(out.data, png);
         assert_eq!(out.converted_from, None);
+    }
+
+    #[test]
+    fn truncated_png_with_valid_header_is_refused_until_complete() {
+        let png = tiny_png();
+        let partial = png[..png.len() / 2].to_vec();
+        assert_eq!(sniff_provider_media_type(&partial), Some("image/png"));
+        assert!(normalize_image_bytes(partial.clone()).is_err());
+        assert!(normalize_image_bytes(png.clone()).is_ok());
+        // A cached complete image must not make its incomplete prefix valid.
+        assert!(normalize_image_bytes(partial).is_err());
+        assert_eq!(normalize_image_bytes(png.clone()).unwrap().data, png);
+    }
+
+    #[test]
+    fn png_requires_complete_chunks_and_iend_even_after_pixels_decode() {
+        let png = tiny_png();
+        for end in [33, png.len() / 2, png.len() - 12, png.len() - 1] {
+            assert!(
+                normalize_image_bytes(png[..end].to_vec()).is_err(),
+                "accepted prefix ending at {end}"
+            );
+        }
+        assert!(normalize_image_bytes(png).is_ok());
     }
 
     #[test]

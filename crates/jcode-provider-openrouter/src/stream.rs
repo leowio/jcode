@@ -393,14 +393,25 @@ impl OpenRouterStream {
 
             // Check for error
             if let Some(error) = parsed.get("error") {
-                let message = error
+                let mut message = error
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("OpenRouter error")
                     .to_string();
+                // Gateways often return HTTP 200 before an SSE error. Retain
+                // the envelope's classification for repair and retry policy.
+                for key in ["code", "type"] {
+                    if let Some(value) = error.get(key).and_then(Value::as_str)
+                        && !message
+                            .to_ascii_lowercase()
+                            .contains(&value.to_ascii_lowercase())
+                    {
+                        message = format!("{value}: {message}");
+                    }
+                }
                 return Some(StreamEvent::Error {
                     message,
-                    retry_after_secs: None,
+                    retry_after_secs: error.get("retry_after").and_then(Value::as_u64),
                 });
             }
 
