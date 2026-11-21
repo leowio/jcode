@@ -361,17 +361,30 @@ async fn stream_response(
                 );
             }
         };
-        if (azure_responses || responses_api)
-            && let StreamEvent::Error {
-                message,
-                retry_after_secs,
-            } = &event
+        if let StreamEvent::Error {
+            message,
+            retry_after_secs,
+        } = &event
         {
-            return Err(if azure_responses {
-                azure_response_failure(message, *retry_after_secs)
-            } else {
-                responses_stream_failure(message, *retry_after_secs, "OpenAI-compatible Responses")
-            });
+            if azure_responses || responses_api {
+                return Err(if azure_responses {
+                    azure_response_failure(message, *retry_after_secs)
+                } else {
+                    responses_stream_failure(
+                        message,
+                        *retry_after_secs,
+                        "OpenAI-compatible Responses",
+                    )
+                });
+            }
+            let failure = responses_stream_failure(
+                message,
+                *retry_after_secs,
+                "OpenAI-compatible chat",
+            );
+            if retryable_stream_failure(&failure) {
+                return Err(failure);
+            }
         }
         if azure_responses {
             if matches!(event, StreamEvent::MessageEnd { .. }) {

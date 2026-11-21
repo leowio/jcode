@@ -1489,19 +1489,26 @@ impl OpenRouterProvider {
     /// - the prefix matches either this provider's own `profile_id` or a known
     ///   built-in OpenAI-compatible profile id.
     ///
-    /// Built-in routing prefixes (`claude:`, `openai:`, `copilot:`, ...) are
-    /// left intact so switching the active provider from a saved session still
-    /// round-trips verbatim.
+    /// Built-in foreign routing prefixes (`claude:`, `openai:`, `copilot:`, ...)
+    /// are left intact so switching the active provider from a saved session
+    /// still round-trips verbatim. This runtime's own `openrouter:` prefix is
+    /// stripped so a standalone `OpenRouterProvider` (including named
+    /// OpenAI-compatible profiles like `magpie`) never leaks
+    /// `openrouter:<model>` onto the wire.
     fn strip_session_profile_prefix<'a>(&self, model: &'a str) -> &'a str {
         let Some((prefix, rest)) = model.split_once(':') else {
             return model;
         };
-        if jcode_provider_core::explicit_model_provider_prefix(model).is_some() {
-            return model;
-        }
         let rest = rest.trim();
         if rest.is_empty() {
             return model;
+        }
+        if let Some((provider, _, _)) = jcode_provider_core::explicit_model_provider_prefix(model) {
+            return if provider == jcode_provider_core::ActiveProvider::OpenRouter {
+                rest
+            } else {
+                model
+            };
         }
         let prefix = prefix.trim();
         let matches_known_profile = self

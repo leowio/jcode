@@ -287,8 +287,7 @@ impl MultiProvider {
             return Some(provider_key);
         }
 
-        Self::session_provider_key_from_provider_name(provider_name)
-            .or_else(|| crate::session::derive_session_provider_key(provider_name))
+        Self::fallback_session_provider_key(provider_name)
     }
 
     pub fn session_provider_key_after_model_switch(
@@ -302,6 +301,7 @@ impl MultiProvider {
             return Some(provider_key);
         }
 
+        let fallback = Self::fallback_session_provider_key(provider_name);
         if let Some(previous_provider_key) = previous_provider_key
             .map(str::trim)
             .filter(|provider_key| !provider_key.is_empty())
@@ -309,12 +309,59 @@ impl MultiProvider {
                 previous_provider_key,
                 provider_name,
             )
+            // When the active OpenRouter runtime is bound to a named
+            // OpenAI-compatible profile (e.g. `--provider-profile magpie`), do
+            // not leave a bare `"openrouter"` key pinned on the session.
+            && !(previous_provider_key.eq_ignore_ascii_case("openrouter")
+                && fallback.as_deref().is_some_and(|key| key != "openrouter"))
         {
             return Some(previous_provider_key.to_string());
         }
 
+        fallback
+    }
+
+    fn fallback_session_provider_key(provider_name: &str) -> Option<String> {
+        if provider_name.trim().eq_ignore_ascii_case("openrouter")
+            && let Some(profile_key) = Self::active_openai_compatible_env_provider_key()
+        {
+            return Some(profile_key);
+        }
         Self::session_provider_key_from_provider_name(provider_name)
             .or_else(|| crate::session::derive_session_provider_key(provider_name))
+    }
+
+    fn active_openai_compatible_env_provider_key() -> Option<String> {
+        let cfg = crate::config::config();
+        for var in [
+            "JCODE_NAMED_PROVIDER_PROFILE",
+            "JCODE_OPENROUTER_CACHE_NAMESPACE",
+            "JCODE_RUNTIME_PROVIDER",
+        ] {
+            let Ok(raw) = std::env::var(var) else {
+                continue;
+            };
+            let trimmed = raw.trim();
+            if trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case("openrouter")
+                || trimmed.eq_ignore_ascii_case("openai-compatible")
+            {
+                continue;
+            }
+            if let Some((key, _)) = cfg
+                .providers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(trimmed))
+            {
+                return Some(key.clone());
+            }
+            if crate::provider_catalog::resolve_openai_compatible_profile_selection(trimmed)
+                .is_some()
+            {
+                return Some(trimmed.to_ascii_lowercase());
+            }
+        }
+        None
     }
 
     fn session_provider_key_from_provider_name(provider_name: &str) -> Option<String> {
@@ -977,5 +1024,53 @@ mod tests {
             Some(ActiveProvider::OpenRouter)
         );
         assert!(MultiProvider::resolve_config_provider_selection("unknown", &cfg).is_none());
+    }
+
+    #[test]
+    fn model_switch_under_active_openai_compatible_profile_persists_profile_key() {
+        let _guard = crate::storage::lock_test_env();
+        let prev_named = std::env::var_os("JCODE_NAMED_PROVIDER_PROFILE");
+        let prev_ns = std::env::var_os("JCODE_OPENROUTER_CACHE_NAMESPACE");
+        let prev_rt = std::env::var_os("JCODE_RUNTIME_PROVIDER");
+
+        crate::env::remove_var("JCODE_NAMED_PROVIDER_PROFILE");
+        crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", "kimi");
+        crate::env::set_var("JCODE_RUNTIME_PROVIDER", "kimi");
+
+        // Migrating a session whose old profile key is gone must persist the
+        // active OpenAI-compatible profile key rather than generic "openrouter".
+        assert_eq!(
+            MultiProvider::session_provider_key_after_model_switch(
+                "kimi-k2.5",
+                "openrouter",
+                Some("removed-legacy-profile"),
+            )
+            .as_deref(),
+            Some("kimi")
+        );
+        // Re-selecting a bare model also heals a stale "openrouter" key back to
+        // the active profile key.
+        assert_eq!(
+            MultiProvider::session_provider_key_after_model_switch(
+                "kimi-k2.5",
+                "openrouter",
+                Some("openrouter"),
+            )
+            .as_deref(),
+            Some("kimi")
+        );
+
+        match prev_named {
+            Some(v) => crate::env::set_var("JCODE_NAMED_PROVIDER_PROFILE", v),
+            None => crate::env::remove_var("JCODE_NAMED_PROVIDER_PROFILE"),
+        }
+        match prev_ns {
+            Some(v) => crate::env::set_var("JCODE_OPENROUTER_CACHE_NAMESPACE", v),
+            None => crate::env::remove_var("JCODE_OPENROUTER_CACHE_NAMESPACE"),
+        }
+        match prev_rt {
+            Some(v) => crate::env::set_var("JCODE_RUNTIME_PROVIDER", v),
+            None => crate::env::remove_var("JCODE_RUNTIME_PROVIDER"),
+        }
     }
 }

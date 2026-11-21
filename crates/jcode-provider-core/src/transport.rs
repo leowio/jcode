@@ -88,6 +88,13 @@ pub fn is_transient_transport_error(error_str: &str) -> bool {
         || lower.contains("goaway")
         || lower.contains("go away")
         || lower.contains("sendrequest")
+        // OpenAI / Codex Responses WebSockets have a hard 60-minute connection
+        // lifetime limit ("Responses websocket connection limit reached (60 minutes).
+        // Create a new websocket connection to continue."). Retrying opens a
+        // fresh upstream WebSocket connection.
+        || lower.contains("websocket connection limit")
+        || lower.contains("websocket_connection_limit_reached")
+        || lower.contains("create a new websocket connection to continue")
 }
 
 #[cfg(test)]
@@ -216,5 +223,16 @@ mod tests {
         }
         assert!(!is_transient_transport_error("native request rejected"));
         assert!(!is_transient_transport_error("invalid response body schema"));
+    }
+
+    #[test]
+    fn responses_websocket_connection_limit_is_transient() {
+        for message in [
+            "Responses websocket connection limit reached (60 minutes). Create a new websocket connection to continue.",
+            "websocket_connection_limit_reached",
+            "Create a new websocket connection to continue.",
+        ] {
+            assert!(is_transient_transport_error(message), "{message}");
+        }
     }
 }

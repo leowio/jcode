@@ -2322,6 +2322,29 @@ fn named_profile_set_model_strips_other_known_profile_prefix() {
 }
 
 #[test]
+fn named_profile_set_model_strips_openrouter_own_prefix() {
+    // Sessions saved with `provider_key = "openrouter"` reconstruct
+    // `openrouter:<model>` on resume. A standalone `OpenRouterProvider` (both
+    // named OpenAI-compatible profiles like `magpie` and real OpenRouter) must
+    // strip its own `openrouter:` prefix so the upstream API never receives
+    // `openrouter:gpt-6.2-sol`.
+    let named_profile = OpenRouterProvider {
+        profile_id: Some("magpie".to_string()),
+        supports_provider_features: false,
+        supports_model_catalog: false,
+        ..make_custom_compatible_provider()
+    };
+    named_profile.set_model("openrouter:gpt-6.2-sol").unwrap();
+    assert_eq!(named_profile.model(), "gpt-6.2-sol");
+
+    let openrouter = make_custom_compatible_provider();
+    openrouter
+        .set_model("openrouter:anthropic/claude-sonnet-4.5")
+        .unwrap();
+    assert_eq!(openrouter.model(), "anthropic/claude-sonnet-4.5");
+}
+
+#[test]
 fn named_profile_set_model_keeps_builtin_routing_prefixes() {
     // Built-in provider routing prefixes must round-trip verbatim so a user can
     // switch the active provider from a saved session.
